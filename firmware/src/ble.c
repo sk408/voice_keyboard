@@ -41,6 +41,7 @@ static ssize_t nus_rx_write(struct bt_conn *conn,
 {
 	ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(offset); ARG_UNUSED(flags);
 
+	app_led_debug(APP_LED_RX_WRITE);
 	typing_feed(buf, len);
 	return len;
 }
@@ -50,6 +51,13 @@ static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	ARG_UNUSED(attr);
 
 	tx_notif_enabled = (value == BT_GATT_CCC_NOTIFY);
+	if (tx_notif_enabled) {
+		/* Send an initial idle status: a central that waits for a
+		 * status byte before its first RX write would otherwise
+		 * block forever (statuses were only sent after writes).
+		 */
+		ble_notify_status(0x00);
+	}
 }
 
 BT_GATT_SERVICE_DEFINE(nus_svc,
@@ -226,8 +234,15 @@ void ble_notify_status(uint8_t status)
 		return;
 	}
 
-	/* attrs[1] is the TX characteristic value attribute. */
-	bt_gatt_notify(current_conn, &nus_svc.attrs[1], &status, sizeof(status));
+	/* nus_svc attribute layout:
+	 *   attrs[0] primary service, attrs[1] TX declaration,
+	 *   attrs[2] TX value, attrs[3] TX CCC,
+	 *   attrs[4] RX declaration, attrs[5] RX value.
+	 * Notifications must be sent on the VALUE attribute (attrs[2]);
+	 * using attrs[1] notifies the declaration handle, which no central
+	 * subscribes to, so every status byte is silently dropped.
+	 */
+	bt_gatt_notify(current_conn, &nus_svc.attrs[2], &status, sizeof(status));
 }
 
 int ble_init(void)

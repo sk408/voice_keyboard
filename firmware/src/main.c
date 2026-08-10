@@ -11,6 +11,68 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 /* Green LED (led0): slow blink = advertising, solid = connected. */
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
+/* Red debug LED (led1): temporary bring-up aid, see DEBUG_NOTES.md. */
+static const struct gpio_dt_spec dbg_led =
+	GPIO_DT_SPEC_GET_OR(DT_ALIAS(led1), gpios, {0});
+
+static uint8_t dbg_pulses;
+static uint16_t dbg_on_ms;
+static uint16_t dbg_off_ms;
+static bool dbg_led_on;
+
+static void dbg_led_work_handler(struct k_work *work);
+
+static K_WORK_DELAYABLE_DEFINE(dbg_led_work, dbg_led_work_handler);
+
+static void dbg_led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (dbg_led_on) {
+		gpio_pin_set_dt(&dbg_led, 0);
+		dbg_led_on = false;
+		if (dbg_pulses > 0) {
+			k_work_reschedule(&dbg_led_work, K_MSEC(dbg_off_ms));
+		}
+		return;
+	}
+
+	if (dbg_pulses > 0) {
+		dbg_pulses--;
+		gpio_pin_set_dt(&dbg_led, 1);
+		dbg_led_on = true;
+		k_work_reschedule(&dbg_led_work, K_MSEC(dbg_on_ms));
+	}
+}
+
+void app_led_debug(enum app_led_code code)
+{
+	if (dbg_led.port == NULL) {
+		return;
+	}
+
+	switch (code) {
+	case APP_LED_RX_WRITE:
+		dbg_on_ms = 80; dbg_off_ms = 80; dbg_pulses = 1;
+		break;
+	case APP_LED_HID_SENT:
+		dbg_on_ms = 80; dbg_off_ms = 80; dbg_pulses = 2;
+		break;
+	case APP_LED_HID_FAIL:
+		dbg_on_ms = 120; dbg_off_ms = 120; dbg_pulses = 3;
+		break;
+	case APP_LED_HID_READY:
+		dbg_on_ms = 1000; dbg_off_ms = 0; dbg_pulses = 1;
+		break;
+	default:
+		return;
+	}
+
+	if (!dbg_led_on) {
+		k_work_reschedule(&dbg_led_work, K_NO_WAIT);
+	}
+}
+
 /* Onboard button (sw0): opens the 60 s pairing window. */
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
@@ -111,6 +173,10 @@ int main(void)
 		gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
 	} else {
 		LOG_WRN("LED not available, continuing without it");
+	}
+
+	if (dbg_led.port != NULL && gpio_is_ready_dt(&dbg_led)) {
+		gpio_pin_configure_dt(&dbg_led, GPIO_OUTPUT_INACTIVE);
 	}
 
 	k_timer_start(&led_timer, K_MSEC(500), K_MSEC(500));

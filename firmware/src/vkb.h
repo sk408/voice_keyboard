@@ -11,6 +11,16 @@ void app_led_advertising(void);
 void app_led_connected(void);
 void app_led_off(void);
 
+/* Temporary bring-up aid: red LED (led1) blink codes, see DEBUG_NOTES.md. */
+enum app_led_code {
+	APP_LED_RX_WRITE,	/* 1 short blink: NUS RX bytes received */
+	APP_LED_HID_SENT,	/* 2 short blinks: host clocked out first report */
+	APP_LED_HID_FAIL,	/* 3 blinks: HID report submit failed/not ready */
+	APP_LED_HID_READY,	/* solid 1 s: host configured the HID interface */
+};
+
+void app_led_debug(enum app_led_code code);
+
 /* --- USB HID keyboard (usb_kbd.c) --- */
 int usb_kbd_init(void);
 bool usb_kbd_ready(void);

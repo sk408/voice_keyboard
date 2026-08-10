@@ -5,9 +5,11 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <string.h>
 
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
+#include <zephyr/drivers/usb/udc_buf.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usb_kbd, LOG_LEVEL_INF);
@@ -34,21 +36,54 @@ static const uint8_t hid_report_desc[] = HID_KEYBOARD_REPORT_DESC();
 static const struct device *hid_dev =
 	DEVICE_DT_GET(DT_NODELABEL(hid_dev_0));
 
-static bool kb_ready;
+/*
+ * Report buffer must satisfy the UDC driver alignment contract
+ * (usbd_hid asserts IS_UDC_ALIGNED, but CONFIG_ASSERT is off in this
+ * build, so a misaligned buffer would fail silently). A static buffer is
+ * safe here: submission is synchronous (this build registers no
+ * input_report_done callback, so hid_device_submit_report() blocks until
+ * the host has clocked the report out) and there is a single producer
+ * (the typing thread). Also serves as the last-report state for
+ * kb_get_report().
+ */
+UDC_STATIC_BUF_DEFINE(kb_report, KB_REPORT_COUNT);
+
+/* Written by the USBD thread, read by the typing thread. */
+static atomic_t kb_ready;
+
+/* One-shot "host clocked out the first report" debug pulse per session. */
+static bool kb_sent_pulse_done;
 
 static void kb_iface_ready(const struct device *dev, const bool ready)
 {
 	LOG_INF("HID interface %s", ready ? "ready" : "not ready");
-	kb_ready = ready;
+	atomic_set(&kb_ready, ready);
+	if (ready) {
+		kb_sent_pulse_done = false;
+		app_led_debug(APP_LED_HID_READY);
+	}
 }
 
 static int kb_get_report(const struct device *dev,
 			 const uint8_t type, const uint8_t id, const uint16_t len,
 			 uint8_t *const buf)
 {
-	ARG_UNUSED(dev); ARG_UNUSED(type); ARG_UNUSED(id);
-	ARG_UNUSED(len); ARG_UNUSED(buf);
-	return -ENOTSUP;
+	ARG_UNUSED(dev); ARG_UNUSED(id);
+
+	/*
+	 * Answer GET_REPORT(INPUT) with the last submitted report. A
+	 * non-positive return stalls the control pipe (usbd_hid maps it
+	 * to a protocol error), which some host HID stacks treat as a
+	 * device malfunction during enumeration/driver start.
+	 */
+	if (type != HID_REPORT_TYPE_INPUT) {
+		return -ENOTSUP;
+	}
+
+	uint16_t n = MIN(len, KB_REPORT_COUNT);
+
+	memcpy(buf, kb_report, n);
+	return n;
 }
 
 static int kb_set_report(const struct device *dev,
@@ -202,19 +237,32 @@ err:
 
 bool usb_kbd_ready(void)
 {
-	return kb_ready;
+	return atomic_get(&kb_ready) != 0;
 }
 
 int usb_kbd_report(uint8_t mods, uint8_t key)
 {
-	uint8_t report[KB_REPORT_COUNT] = {0};
+	int ret;
 
-	if (!kb_ready) {
+	if (!atomic_get(&kb_ready)) {
+		app_led_debug(APP_LED_HID_FAIL);
 		return -ENOTCONN;
 	}
 
-	report[KB_MOD_KEY] = mods;
-	report[KB_KEY_CODE1] = key;
+	memset(kb_report, 0, KB_REPORT_COUNT);
+	kb_report[KB_MOD_KEY] = mods;
+	kb_report[KB_KEY_CODE1] = key;
 
-	return hid_device_submit_report(hid_dev, KB_REPORT_COUNT, report);
+	ret = hid_device_submit_report(hid_dev, KB_REPORT_COUNT, kb_report);
+	if (ret) {
+		app_led_debug(APP_LED_HID_FAIL);
+	} else if (!kb_sent_pulse_done) {
+		/* Submit is synchronous: a success means the host actually
+		 * polled the report off the interrupt IN endpoint.
+		 */
+		kb_sent_pulse_done = true;
+		app_led_debug(APP_LED_HID_SENT);
+	}
+
+	return ret;
 }
