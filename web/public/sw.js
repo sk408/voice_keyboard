@@ -1,0 +1,65 @@
+/**
+ * Voice Keyboard service worker — offline app shell.
+ *
+ * Strategy: precache the index at install; at runtime, cache-first for
+ * same-origin GETs with network fallback (hashed Vite assets are immutable,
+ * so this is safe), and navigation requests fall back to the cached shell
+ * when offline. BLE itself obviously needs the dongle and does not work
+ * offline, but the shell loads.
+ */
+const CACHE = 'voicekb-v1';
+const BASE = self.registration.scope;
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches
+      .open(CACHE)
+      .then((cache) => cache.add(new URL('./', BASE).href))
+      .then(() => self.skipWaiting()),
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim()),
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+  if (request.method !== 'GET' || !request.url.startsWith(self.location.origin)) return;
+
+  // Navigation requests: network first, fall back to cached shell offline.
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE).then((cache) => cache.put(request, copy));
+          return response;
+        })
+        .catch(() => caches.match(request).then((r) => r || caches.match(new URL('./', BASE).href))),
+    );
+    return;
+  }
+
+  // Same-origin assets: cache first, populate on miss.
+  if (request.url.startsWith(self.location.origin)) {
+    event.respondWith(
+      caches.match(request).then(
+        (cached) =>
+          cached ||
+          fetch(request).then((response) => {
+            if (response.ok) {
+              const copy = response.clone();
+              caches.open(CACHE).then((cache) => cache.put(request, copy));
+            }
+            return response;
+          }),
+      ),
+    );
+  }
+});

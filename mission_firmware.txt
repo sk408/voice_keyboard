@@ -1,0 +1,27 @@
+# Mission: Voice Keyboard firmware — nRF52840 dongle, BLE NUS → USB HID keyboard
+
+Work in /home/claude/voice_keyboard/firmware (new Zephyr application). READ /home/claude/voice_keyboard/PROTOCOL.md FIRST — it is the contract.
+
+## Hardware & toolchain (already on this machine — reuse, don't reinstall)
+
+- Board: Nordic PCA10059 dongle (nRF52840) with Adafruit UF2 bootloader
+- Zephyr 4.1.0 workspace: ~/noahlink_emu/zephyrproject (west works from there)
+- SDK: ~/zephyr-sdk-0.17.0, cmake 3.31.6 via venv, gperf in ~/.local
+- **Reference build config: ~/noahlink_emu/app** — a working Zephyr app for this EXACT dongle: UF2 output (CONFIG_BUILD_OUTPUT_UF2=y, UF2 family 0xada52840), Adafruit bootloader FLASH_LOAD_OFFSET=0x26000, board target name, USB device stack choices. Copy what works; do NOT touch that repo.
+- Zephyr samples worth starting from: samples/bluetooth/peripheral_uart (NUS peripheral), USB HID keyboard sample for the usbd stack in this Zephyr version.
+
+## Requirements
+
+1. **USB HID keyboard** (boot protocol compatible) toward the PC. No vendor USB interfaces. Must enumerate cleanly on Windows/Android hosts.
+2. **BLE NUS peripheral** per PROTOCOL.md: name `VoiceKB`, NUS service 6E400001-..., RX write char 6E400002-..., TX notify 6E400003-..., DIS firmware rev `vk-1.0`.
+3. **Typing engine**: RX bytes → HID key reports, US layout, shift handling for capitals/symbols, `\n`=Enter, `\t`=Tab, 0x08=Backspace, 0x00-escaped special keys (Esc, arrows, Del, Home, End, PgUp/PgDn, F1–F12) per PROTOCOL.md. Rate-limit ~15ms/keystroke. Robust to arbitrary BLE chunking (reassemble a byte stream; never split the 0x00 escape pair across processing).
+4. **Security**: LE bonding required for RX writes (encrypted link). Pairing window: bondable 60s after single press of the dongle's onboard button; outside the window only bonded centrals connect. If the button proves unusable (UF2 bootloader conflict), fall back to always-bondable and note it in README. Bond keys persisted in flash (settings subsystem).
+5. **TX status notifies**: 0x00 idle / 0x01 busy, best effort.
+6. LED feedback if the dongle LED is free: slow blink = advertising/pairing window, solid = connected. (Nice-to-have, don't break the build over it.)
+
+## Done means
+
+- `west build -b <dongle board>` succeeds clean in the existing toolchain and produces `build/zephyr/zephyr.uf2`
+- `firmware/README.md`: exact build commands (copy-pasteable), flash instructions (drag UF2 in bootloader mode), button/pairing behavior, known limitations
+- git commit in /home/claude/voice_keyboard on branch `main` (repo root is the parent dir — do not `git init` inside firmware/)
+- Do NOT push to GitHub. Do NOT attempt hardware flashing/testing — VPS has no dongle attached.

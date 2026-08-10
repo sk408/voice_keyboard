@@ -1,0 +1,26 @@
+# Mission: Voice Keyboard web app — PWA for Android Chrome (phone → PC typing)
+
+Work in /home/claude/voice_keyboard/web (new Vite + React 18 + TypeScript app; zustand for state, matching the user's other apps). READ /home/claude/voice_keyboard/PROTOCOL.md FIRST — it is the contract with the dongle firmware.
+
+## What it is
+
+A phone web app (PWA) that connects over Web Bluetooth to an nRF52840 dongle plugged into a PC. The dongle is a USB HID keyboard; whatever you type/dictate on the phone appears on the PC. Voice input comes free from the phone keyboard's dictation mic.
+
+## Requirements
+
+1. **Connect**: requestDevice filtered by NUS service UUID (6E400001-...), name prefix `VoiceKB` acceptable fallback. Bond on first connect (encrypted link required by firmware). Handle Android-Chrome bonding quirks; clear error surfaces, not silent failures.
+2. **Two typing modes**:
+   - **Live mode**: every character (and Backspace) sent as produced (input events + keydown for specials). This is the dictation mode — Gboard mic fills the field, text streams to the PC.
+   - **Compose mode**: type/paste/dictate a block, then Send types the whole thing out on the PC.
+3. **Special keys bar**: Esc, Tab, Enter, Backspace, arrows, Del — sent as 0x00-escaped codes per PROTOCOL.md.
+4. **Status UX**: connection state, bonded state, typing-busy (TX notifies 0x00/0x01), and clear pairing guidance ("press the dongle button to enter pairing mode" on first-time auth failures).
+5. **Persistence**: navigator.bluetooth.getDevices() for previously granted devices → one-tap reconnect without the chooser. localStorage for last-mode prefs.
+6. **PWA**: manifest + service worker, installable to Android home screen, works offline as a shell (BLE obviously needs the dongle). Name "Voice Keyboard".
+7. **Deploy config**: GitHub Actions → GitHub Pages, vite base `/voice_keyboard/`. Repo root is /home/claude/voice_keyboard (parent dir, already a git repo with PROTOCOL.md) — put the workflow at .github/workflows/deploy.yml, Pages artifact from web/build or web/dist.
+
+## Done means
+
+- `npm install && npm run build` passes in web/ (tsc --noEmit + vite build)
+- Any tests you add stay green
+- web/README.md: usage (connect, pair, both modes), PWA install steps, browser requirements (Android Chrome; desktop Chrome also works)
+- git commit on `main`. Do NOT push to GitHub.

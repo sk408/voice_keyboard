@@ -1,0 +1,222 @@
+:root {
+  color-scheme: dark;
+  --bg: #1a1d29;
+  --panel: #242837;
+  --panel-2: #2d3247;
+  --text: #e8eaf2;
+  --muted: #9aa1b8;
+  --accent: #4f8cff;
+  --ok: #35c26e;
+  --warn: #e0a83c;
+  --err: #e05555;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.app {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100dvh;
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 4px 0;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--accent);
+  border: none;
+  border-radius: 10px;
+  padding: 12px 18px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.secondary {
+  background: var(--panel-2);
+}
+
+/* Status bar */
+.status-bar {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot-disconnected {
+  background: var(--muted);
+}
+
+.dot-connecting {
+  background: var(--warn);
+  animation: pulse 1s infinite alternate;
+}
+
+.dot-connected {
+  background: var(--ok);
+}
+
+@keyframes pulse {
+  from {
+    opacity: 0.4;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.status-text {
+  font-weight: 600;
+}
+
+.badge {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.badge-ok {
+  color: var(--ok);
+}
+
+.badge-busy {
+  color: var(--warn);
+}
+
+.status-actions,
+.granted-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.granted-label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.error-banner {
+  background: color-mix(in srgb, var(--err) 18%, var(--panel));
+  border: 1px solid var(--err);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.pairing-hint {
+  color: var(--warn);
+}
+
+/* Mode toggle */
+.mode-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.mode-toggle button {
+  background: var(--panel-2);
+  font-weight: 600;
+}
+
+.mode-toggle button.mode-active {
+  background: var(--accent);
+}
+
+/* Input panels */
+.input-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+
+.type-area {
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: 12px;
+  padding: 12px;
+  resize: vertical;
+  min-height: 140px;
+}
+
+.type-area:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.panel-actions button:first-child {
+  flex: 1;
+}
+
+/* Special keys bar */
+.keys-bar {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+  margin-top: auto;
+}
+
+.key-btn {
+  background: var(--panel-2);
+  padding: 10px 4px;
+  font-size: 0.95rem;
+}
+
+.key-wide {
+  grid-column: span 2;
+}
