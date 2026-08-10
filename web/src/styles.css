@@ -220,3 +220,14 @@ button.secondary {
 .key-wide {
   grid-column: span 2;
 }
+
+/* Service worker update banner */
+.update-banner {
+  position: fixed;
+  left: 50%;
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 1000;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  white-space: nowrap;
+}
