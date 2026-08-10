@@ -1,0 +1,14 @@
+/*
+ * Voice Keyboard — nRF52840 dongle additions.
+ * The board DTS already enables zephyr_udc0; we only need the HID device node.
+ */
+
+/ {
+	hid_dev_0: hid_dev_0 {
+		compatible = "zephyr,hid-device";
+		interface-name = "HID0";
+		protocol-code = "keyboard";
+		in-report-size = <8>;
+		in-polling-period-us = <1000>;
+	};
+};
