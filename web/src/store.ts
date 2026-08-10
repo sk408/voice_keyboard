@@ -44,11 +44,32 @@ interface AppState {
 }
 
 let dongle: DongleConnection | null = null;
+/** Sends currently in flight; drives the optimistic "typing…" badge. */
+let pendingSends = 0;
 
 export const useAppStore = create<AppState>((set, get) => {
   function handleSendError(e: unknown): void {
     const { message, pairingHint } = describeBleError(e);
     set({ error: message, pairingHint });
+  }
+
+  /**
+   * Optimistic "typing…" badge: flips busy as soon as a send is queued
+   * and back to idle once every queued send has completed. Firmware TX
+   * notifications keep driving the badge too, but this way a dead notify
+   * path (no status bytes from the dongle) is distinguishable from a
+   * dead write path (badge never flips even optimistically).
+   */
+  function sendBegin(): void {
+    pendingSends++;
+    set({ dongleStatus: 'busy' });
+  }
+
+  function sendEnd(): void {
+    pendingSends = Math.max(0, pendingSends - 1);
+    if (pendingSends === 0 && get().dongleStatus === 'busy') {
+      set({ dongleStatus: 'idle' });
+    }
   }
 
   return {
@@ -99,10 +120,20 @@ export const useAppStore = create<AppState>((set, get) => {
         deviceName: device.name ?? 'VoiceKB dongle',
       });
       try {
-        const conn = await DongleConnection.connect(
+        let conn: DongleConnection | null = null;
+        conn = await DongleConnection.connect(
           device,
-          (status) => set({ dongleStatus: status }),
-          () => set({ connection: 'disconnected', bonded: false, dongleStatus: 'idle' }),
+          // Guard both callbacks by identity: listeners from a previous
+          // connection instance on the same device must not clobber the
+          // state of the current one.
+          (status) => {
+            if (conn !== null && dongle === conn) set({ dongleStatus: status });
+          },
+          () => {
+            if (conn === null || dongle !== conn) return;
+            dongle = null;
+            set({ connection: 'disconnected', bonded: false, dongleStatus: 'idle' });
+          },
         );
         dongle = conn;
         set({ connection: 'connected', bonded: true, dongleStatus: 'idle' });
@@ -141,9 +172,12 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       try {
         set({ error: null });
+        sendBegin();
         await dongle.send(encodeText(text));
       } catch (e) {
         handleSendError(e);
+      } finally {
+        sendEnd();
       }
     },
 
@@ -152,18 +186,24 @@ export const useAppStore = create<AppState>((set, get) => {
       const payload = encodeEdit(prev, next);
       if (payload.length === 0) return;
       try {
+        sendBegin();
         await dongle.send(payload);
       } catch (e) {
         handleSendError(e);
+      } finally {
+        sendEnd();
       }
     },
 
     async sendSpecialKey(key) {
       if (!dongle || get().connection !== 'connected') return;
       try {
+        sendBegin();
         await dongle.send(encodeSpecialKey(key));
       } catch (e) {
         handleSendError(e);
+      } finally {
+        sendEnd();
       }
     },
 

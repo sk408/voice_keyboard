@@ -32,8 +32,18 @@ is a client of it.
 5. If the bond on the phone/PC side gets out of sync, use **Forget**, then
    pair again from scratch.
 
-The status bar shows connection state, paired state, and the dongle's
-typing-busy status (from TX notifications: `0x00` ready / `0x01` busy).
+The status bar shows connection state, paired state, and a typing-status
+badge. The badge flips to **typing…** optimistically the moment a send is
+queued (and back to **ready** when all queued sends complete), and the
+dongle's TX notifications (`0x00` ready / `0x01` busy) drive it too. This
+makes the two failure modes distinguishable when debugging: badge flips
+but nothing is typed → the dongle side is dropping writes; badge never
+flips → the app-side write path is broken.
+
+On the first connection, pairing (Just Works) is triggered by the first
+keystroke write — RX writes require an encrypted link, while the TX
+subscription does not. If a send fails with a pairing error, press the
+dongle button and retry within the 60-second window.
 
 ### Live mode
 
@@ -75,7 +85,7 @@ Deployment is via GitHub Actions → GitHub Pages (see
 ## Layout
 
 - `src/protocol.ts` — pure protocol encoding (chunking, escaping, edit diffs); unit-tested.
-- `src/ble.ts` — Web Bluetooth / NUS connection, write queue, error classification.
+- `src/ble.ts` — Web Bluetooth / NUS connection, write queue, error classification; queue unit-tested (`ble.test.ts`).
 - `src/store.ts` — zustand app state (connection, mode, status, errors).
 - `src/components/` — status bar, mode toggle, live/compose inputs, special keys bar.
 - `public/` — manifest, service worker, icons (`scripts/gen_icons.py` regenerates them).

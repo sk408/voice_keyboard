@@ -6,10 +6,10 @@
  * back-to-back writes never overlap on the GATT link, and payloads are
  * chunked to the 20-byte ATT floor (see protocol.ts).
  *
- * Bonding: the firmware requires an encrypted link. On Android Chrome the
- * pairing flow is triggered implicitly by the first GATT operation that
- * needs encryption (our first TX subscription / RX write). Auth failures
- * surface as DOMExceptions whose message mentions pairing/authentication
+ * Bonding: the firmware requires an encrypted link for RX writes. On
+ * Android Chrome the pairing flow is triggered implicitly by the first
+ * GATT operation that needs encryption — the first RX write (the TX
+ * subscription's CCC uses plain permissions). Auth failures surface as DOMExceptions whose message mentions pairing/authentication
  * or as `SecurityError` / `NotAllowedError` — the store maps those to a
  * "press the dongle button" hint.
  */
@@ -102,8 +102,10 @@ export class DongleConnection {
     const service = await server.getPrimaryService(NUS_SERVICE_UUID);
     this.rx = await service.getCharacteristic(NUS_RX_UUID);
 
-    // Subscribe to TX status. This is usually the first encrypted GATT
-    // operation, so on Android it is what kicks off Just Works pairing.
+    // Subscribe to TX status. Note the firmware's CCC uses plain
+    // permissions, so this does NOT require encryption: the first
+    // encrypted GATT operation is the first RX write, which is what
+    // kicks off Just Works pairing on Android.
     const tx = await service.getCharacteristic(NUS_TX_UUID);
     await tx.startNotifications();
     tx.addEventListener('characteristicvaluechanged', (event) => {
@@ -114,6 +116,10 @@ export class DongleConnection {
 
   private onDisconnect: DisconnectListener = () => {};
   private handleDisconnect = () => {
+    // Stop listening: a DongleConnection is single-use, and a stale
+    // listener on the same device would keep firing after a reconnect
+    // swapped in a new instance.
+    this.device.removeEventListener('gattserverdisconnected', this.handleDisconnect);
     this.rx = null;
     this.onDisconnect();
   };
