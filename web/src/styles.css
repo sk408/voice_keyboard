@@ -221,6 +221,118 @@ button.secondary {
   grid-column: span 2;
 }
 
+/* Tab panel (keyboard tab stays mounted but hidden on the mouse tab) */
+.tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+.tab-panel.hidden {
+  display: none;
+}
+
+/* Sticky modifier bar */
+.modifier-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.modifier-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+}
+
+.mod-btn {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.mod-btn.mod-armed {
+  background: var(--warn);
+  color: #1a1d29;
+}
+
+.mod-btn.mod-locked {
+  background: var(--accent);
+}
+
+.mod-tag {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+}
+
+.mod-btn.mod-clear {
+  color: var(--muted);
+}
+
+.modifier-status {
+  font-size: 0.8rem;
+  color: var(--warn);
+  padding: 0 2px;
+}
+
+/* Mouse tab */
+.mouse-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+.trackpad {
+  flex: 1;
+  min-height: 320px;
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 16px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: crosshair;
+}
+
+.trackpad-disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.trackpad-hint {
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.6;
+  pointer-events: none;
+}
+
+.mouse-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+}
+
+.mouse-btn {
+  background: var(--panel-2);
+  touch-action: none;
+}
+
+.mouse-btn:active {
+  background: var(--accent);
+}
+
 /* Service worker update banner */
 .update-banner {
   position: fixed;

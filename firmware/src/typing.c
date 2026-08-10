@@ -1,8 +1,10 @@
 /* Voice Keyboard — typing engine.
  *
  * Consumes the NUS RX byte stream (any BLE chunking) and emits USB HID
- * keyboard reports on a US layout, rate-limited to ~15 ms/keystroke.
- * See PROTOCOL.md for the byte stream contract.
+ * keyboard/mouse reports, keystrokes on a US layout, rate-limited to
+ * ~15 ms/keystroke. Mouse packets are forwarded without the keystroke
+ * rate limit. See PROTOCOL.md for the byte stream contract, including the
+ * v2 modifier (0x81/0x82/0x83) and mouse (0x90) escapes.
  */
 
 #include <zephyr/kernel.h>
@@ -24,8 +26,25 @@ LOG_MODULE_REGISTER(typing, LOG_LEVEL_INF);
 RING_BUF_DECLARE(rx_ring, RX_RING_SIZE);
 K_SEM_DEFINE(rx_sem, 0, 64);
 
-static bool esc_pending;
+/*
+ * Escape parser state. 0x00 introduces an escape; the following code byte
+ * selects either a special key (single parameter-less byte) or one of the
+ * v2 multi-byte sequences (0x81/0x82 take one mask byte, 0x90 takes four
+ * parameter bytes). All states survive chunk boundaries: a sequence is
+ * only resolved once every byte of it has arrived.
+ */
+#define ESC_NONE	0	/* not inside an escape sequence */
+#define ESC_CODE	1	/* 0x00 seen, waiting for the escape code byte */
+
+static uint8_t esc_state = ESC_NONE; /* ESC_NONE/ESC_CODE, or pending 0x81/0x82/0x90 */
+static uint8_t mouse_params[4];	/* buttons, dx, dy, wheel for a pending 0x90 */
+static uint8_t mouse_got;
 static bool busy;
+
+/* Modifier state (v2): bitmask = HID report byte 0. */
+static uint8_t held_mods;	/* 0x82: stay down until 0x83 or disconnect */
+static uint8_t sticky_mods;	/* 0x81: apply to the next keystroke only */
+static bool release_mods_pending; /* deferred release-all on disconnect */
 
 void typing_feed(const void *data, uint16_t len)
 {
@@ -43,7 +62,20 @@ void typing_reset(void)
 {
 	k_sem_reset(&rx_sem);
 	ring_buf_reset(&rx_ring);
-	esc_pending = false;
+	esc_state = ESC_NONE;
+	mouse_got = 0;
+
+	/* A disconnect while modifiers were held must not leave them stuck
+	 * on the host. This runs on the BLE RX thread, where the blocking
+	 * HID submit must not be called, so defer the release report to the
+	 * typing thread.
+	 */
+	if (held_mods != 0 || sticky_mods != 0) {
+		held_mods = 0;
+		sticky_mods = 0;
+		release_mods_pending = true;
+		k_sem_give(&rx_sem);
+	}
 }
 
 /* Map printable US-ASCII to (modifier, HID keycode) on a US layout. */
@@ -108,16 +140,22 @@ static bool ascii_to_hid(uint8_t c, uint8_t *mod, uint8_t *key)
 	return true;
 }
 
-/* One keystroke: press, short hold, release, inter-key gap. */
+/* One keystroke: press, short hold, release, inter-key gap. Held
+ * modifiers (0x82) stay down across keystrokes; sticky modifiers (0x81)
+ * apply to this keystroke and auto-release with it.
+ */
 static void tap(uint8_t mod, uint8_t key)
 {
 	if (key == 0) {
 		return;
 	}
 
-	if (usb_kbd_report(mod, key) == 0) {
+	uint8_t mods = mod | held_mods | sticky_mods;
+
+	sticky_mods = 0;
+	if (usb_kbd_report(mods, key) == 0) {
 		k_msleep(KEY_PRESS_MS);
-		usb_kbd_report(0, 0);
+		usb_kbd_report(held_mods, 0);
 	}
 	k_msleep(KEY_GAP_MS);
 }
@@ -151,20 +189,89 @@ static void handle_escape(uint8_t code)
 	tap(0, key);
 }
 
+/* 0x90 mouse packet complete: buttons (bit0 left, bit1 right, bit2
+ * middle) + signed dx/dy/wheel, per PROTOCOL.md v2.
+ */
+static void handle_mouse_packet(void)
+{
+	app_led_debug(APP_LED_MOUSE_RX);
+	usb_mouse_report(mouse_params[0],
+			 (int8_t)mouse_params[1],
+			 (int8_t)mouse_params[2],
+			 (int8_t)mouse_params[3]);
+}
+
+/* Parameter byte of a pending multi-byte escape (0x81/0x82/0x90). */
+static void handle_escape_param(uint8_t b)
+{
+	switch (esc_state) {
+	case 0x81: /* sticky-arm modifiers for the next keystroke */
+		sticky_mods = b;
+		esc_state = ESC_NONE;
+		break;
+	case 0x82: /* hold modifiers down until 0x83; press them now */
+		held_mods = b;
+		sticky_mods = 0;
+		esc_state = ESC_NONE;
+		usb_kbd_report(held_mods, 0);
+		break;
+	case 0x90: /* mouse packet: buttons, dx, dy, wheel */
+		mouse_params[mouse_got++] = b;
+		if (mouse_got == sizeof(mouse_params)) {
+			mouse_got = 0;
+			esc_state = ESC_NONE;
+			handle_mouse_packet();
+		}
+		break;
+	default:
+		esc_state = ESC_NONE;
+		break;
+	}
+}
+
+/* Escape code byte (the byte after 0x00), per PROTOCOL.md. */
+static void handle_escape_code(uint8_t b)
+{
+	switch (b) {
+	case 0x81: /* sticky-arm: one mask byte follows */
+	case 0x82: /* hold: one mask byte follows */
+		esc_state = b;
+		return;
+	case 0x83: /* release all modifiers */
+		held_mods = 0;
+		sticky_mods = 0;
+		usb_kbd_report(0, 0);
+		return;
+	case 0x90: /* mouse: four parameter bytes follow */
+		mouse_got = 0;
+		esc_state = b;
+		return;
+	default:
+		handle_escape(b);
+		return;
+	}
+}
+
 static void process_byte(uint8_t b)
 {
-	/* A pending escape survives chunk boundaries: the pair is only
-	 * resolved once both bytes have arrived.
+	/* A pending escape survives chunk boundaries: each sequence is only
+	 * resolved once all of its bytes have arrived.
 	 */
-	if (esc_pending) {
-		esc_pending = false;
-		handle_escape(b);
+	if (esc_state != ESC_NONE) {
+		uint8_t pending = esc_state;
+
+		if (pending != ESC_CODE) {
+			handle_escape_param(b);
+		} else {
+			esc_state = ESC_NONE;
+			handle_escape_code(b);
+		}
 		return;
 	}
 
 	switch (b) {
 	case 0x00:
-		esc_pending = true;
+		esc_state = ESC_CODE;
 		break;
 	case '\n':
 		tap(0, HID_KEY_ENTER);
@@ -199,6 +306,14 @@ static void typing_thread(void *p1, void *p2, void *p3)
 		uint32_t n;
 
 		k_sem_take(&rx_sem, K_FOREVER);
+
+		/* Deferred release-all from typing_reset() (disconnect while
+		 * modifiers were held): unblock the host-side modifiers.
+		 */
+		if (release_mods_pending) {
+			release_mods_pending = false;
+			usb_kbd_report(0, 0);
+		}
 
 		n = ring_buf_get(&rx_ring, buf, sizeof(buf));
 		if (n == 0) {

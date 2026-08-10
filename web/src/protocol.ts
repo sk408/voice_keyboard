@@ -52,6 +52,60 @@ export function encodeSpecialKey(key: SpecialKey): Uint8Array {
   return new Uint8Array([ESCAPE, SPECIAL_KEYS[key]]);
 }
 
+/* --- v2 extensions: modifiers and mouse (PROTOCOL.md "v2 extensions") --- */
+
+/**
+ * Modifier bitmask = HID report byte 0 (left-hand bits only are exposed in
+ * the UI). `0x00 0x81 <mask>` arms the modifiers for the next keystroke
+ * only; `0x00 0x82 <mask>` holds them until release; `0x00 0x83` releases
+ * all.
+ */
+export const MODIFIER_BITS = {
+  ctrl: 0x01,
+  shift: 0x02,
+  alt: 0x04,
+  gui: 0x08,
+} as const;
+
+export type ModifierKey = keyof typeof MODIFIER_BITS;
+
+/** Arm `mask` modifiers for the next keystroke (then auto-release). */
+export function encodeStickyArm(mask: number): Uint8Array {
+  return new Uint8Array([ESCAPE, 0x81, mask & 0xff]);
+}
+
+/** Hold `mask` modifiers down until encodeModifierRelease(). */
+export function encodeModifierHold(mask: number): Uint8Array {
+  return new Uint8Array([ESCAPE, 0x82, mask & 0xff]);
+}
+
+/** Release all held/armed modifiers. */
+export function encodeModifierRelease(): Uint8Array {
+  return new Uint8Array([ESCAPE, 0x83]);
+}
+
+/** Mouse button bits for 0x90 packets. */
+export const MOUSE_BUTTON_LEFT = 0x01;
+export const MOUSE_BUTTON_RIGHT = 0x02;
+export const MOUSE_BUTTON_MIDDLE = 0x04;
+
+/** Deltas are signed int8; the HID descriptor declares -127..127. */
+function clampAxis(v: number): number {
+  return Math.max(-127, Math.min(127, Math.round(v)));
+}
+
+/** One relative mouse report: `0x00 0x90 <buttons> <dx> <dy> <wheel>`. */
+export function encodeMouse(buttons: number, dx: number, dy: number, wheel: number): Uint8Array {
+  return new Uint8Array([
+    ESCAPE,
+    0x90,
+    buttons & 0xff,
+    clampAxis(dx) & 0xff,
+    clampAxis(dy) & 0xff,
+    clampAxis(wheel) & 0xff,
+  ]);
+}
+
 const encoder = new TextEncoder();
 
 /**
@@ -112,6 +166,19 @@ export function encodeEdit(prev: string, next: string): Uint8Array {
 }
 
 /**
+ * Total byte length of the escape sequence that starts with `0x00 <code>`,
+ * or 0 if `code` is not a known escape code. The dongle parses escapes as
+ * fixed-length sequences, so a chunk boundary must never fall inside one.
+ */
+function escapeSeqLen(code: number): number {
+  if (code === 0x81 || code === 0x82) return 3; // sticky-arm / hold + mask byte
+  if (code === 0x83) return 2; // release all
+  if (code === 0x90) return 6; // mouse: buttons, dx, dy, wheel
+  if (isSpecialCode(code)) return 2; // special keys
+  return 0;
+}
+
+/**
  * Split a payload into chunks small enough for a single ATT write.
  * Web Bluetooth does not expose the negotiated MTU; 20 bytes is the
  * ATT_MTU 23 payload floor and works on every link. Chunks are never
@@ -120,20 +187,29 @@ export function encodeEdit(prev: string, next: string): Uint8Array {
  * here we chunk bytes but callers encode whole code points, so a cut can
  * only fall inside a multi-byte sequence if the payload exceeds the chunk
  * size mid-character; scanning for UTF-8 continuation bytes keeps each
- * write decodable on its own).
+ * write decodable on its own). Chunks also never split a `0x00` escape
+ * sequence (special key, modifier, or mouse packet).
  */
 export function chunkPayload(data: Uint8Array, chunkSize = 20): Uint8Array[] {
-  if (chunkSize < 4) throw new Error('chunkSize too small for UTF-8 safety');
+  if (chunkSize < 6) throw new Error('chunkSize too small for escape-sequence safety');
+
+  // Positions where a cut would land inside an escape sequence.
+  const noCut = new Uint8Array(data.length);
+  for (let i = 0; i + 1 < data.length; i++) {
+    if (data[i] !== ESCAPE) continue;
+    const len = escapeSeqLen(data[i + 1]);
+    for (let j = i + 1; j < i + len && j < data.length; j++) noCut[j] = 1;
+  }
+
   const chunks: Uint8Array[] = [];
   let offset = 0;
   while (offset < data.length) {
     let end = Math.min(offset + chunkSize, data.length);
-    // Don't split inside a UTF-8 multi-byte sequence or the 0x00 escape pair.
+    // Don't split inside a UTF-8 multi-byte sequence or a 0x00 escape sequence.
     while (end > offset && end < data.length) {
       const b = data[end];
       const isContinuation = (b & 0xc0) === 0x80;
-      const prevIsEscape = data[end - 1] === ESCAPE && isSpecialCode(b);
-      if (!isContinuation && !prevIsEscape) break;
+      if (!isContinuation && !noCut[end]) break;
       end--;
     }
     if (end === offset) end = Math.min(offset + chunkSize, data.length); // pathological; just cut

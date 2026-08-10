@@ -1,10 +1,11 @@
 # Voice Keyboard — web app
 
-A PWA that turns your phone into a Bluetooth keyboard for your PC. It connects
-over Web Bluetooth to an nRF52840 dongle (advertised as `VoiceKB`) plugged into
-the PC; the dongle is a plain USB HID keyboard to the PC, so whatever you type
-or dictate on the phone appears on the PC. Voice input comes free from the
-phone keyboard's dictation mic (e.g. Gboard).
+A PWA that turns your phone into a Bluetooth keyboard + mouse for your PC.
+It connects over Web Bluetooth to an nRF52840 dongle (advertised as
+`VoiceKB`) plugged into the PC; the dongle is a composite USB HID device
+(keyboard + mouse) to the PC, so whatever you type, dictate, or gesture on
+the phone appears on the PC. Voice input comes free from the phone
+keyboard's dictation mic (e.g. Gboard).
 
 The wire protocol is defined in [`../PROTOCOL.md`](../PROTOCOL.md) — this app
 is a client of it.
@@ -63,6 +64,31 @@ Esc, Tab, Enter, Backspace, arrow keys and Delete. Tab/Enter/Backspace go as
 protocol bytes (`\t` / `\n` / `0x08`); the rest are sent as `0x00`-escaped
 special key codes per PROTOCOL.md.
 
+### Sticky modifiers (keyboard tab)
+
+Ctrl, Shift, Alt and Gui buttons sit above the special keys bar. Each tap
+cycles a modifier through three states, all visible on the button and in
+the status line below the bar:
+
+- **armed** (`next`) — applies to the *next* key or special key only: the
+  key goes out prefixed with `0x00 0x81 <mask>` and the modifier disarms.
+  Arm several modifiers to compose a chord (Ctrl + Shift armed, then T →
+  `0x81` with mask `0x03`).
+- **locked** (`hold`) — held down on the PC (`0x00 0x82 <mask>`) until
+  released; affects everything typed/clicked while held.
+- tap again → **off** (`0x00 0x82` with the remaining held set, or
+  `0x00 0x83` release-all when the last one is released). **Clear**
+  releases everything.
+
+### Mouse tab
+
+The **Mouse** tab is a full-width trackpad: one-finger drag moves the
+pointer (0x90 packets, throttled to ~50/s), tap = left click, two-finger
+tap = right click, two-finger drag = scroll wheel. Left/middle/right are
+also available as hold-to-press on-screen buttons (hold Left while dragging
+on the trackpad for drag-select). Switching tabs is pure view state — the
+BLE connection is owned by the store and is never torn down.
+
 ## Install as a PWA (Android)
 
 1. Open the deployed app in Chrome: `https://<user>.github.io/voice_keyboard/`.
@@ -84,8 +110,8 @@ Deployment is via GitHub Actions → GitHub Pages (see
 
 ## Layout
 
-- `src/protocol.ts` — pure protocol encoding (chunking, escaping, edit diffs); unit-tested.
+- `src/protocol.ts` — pure protocol encoding (chunking, escaping, edit diffs, v2 modifier/mouse packets); unit-tested.
 - `src/ble.ts` — Web Bluetooth / NUS connection, write queue, error classification; queue unit-tested (`ble.test.ts`).
-- `src/store.ts` — zustand app state (connection, mode, status, errors).
-- `src/components/` — status bar, mode toggle, live/compose inputs, special keys bar.
+- `src/store.ts` — zustand app state (connection, mode, status, modifier state, errors).
+- `src/components/` — status bar, mode toggle, live/compose inputs, sticky modifier bar, special keys bar, mouse trackpad.
 - `public/` — manifest, service worker, icons (`scripts/gen_icons.py` regenerates them).

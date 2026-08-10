@@ -1,8 +1,9 @@
 # Voice Keyboard firmware — nRF52840 dongle
 
 Zephyr 4.1.0 application for the Nordic PCA10059 dongle (Adafruit UF2
-bootloader). The dongle enumerates as a standard USB HID keyboard (boot
-protocol) and receives keystrokes over BLE NUS per
+bootloader). The dongle enumerates as a single composite USB HID device —
+keyboard (report ID 1) + mouse (report ID 2) in one report descriptor — and
+receives keystrokes and mouse packets over BLE NUS per
 [`../PROTOCOL.md`](../PROTOCOL.md).
 
 ## Build
@@ -31,20 +32,39 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
 
 ## Behavior
 
-- **USB**: single HID keyboard interface, boot-protocol compatible. No vendor
-  interfaces. Enumerates on Windows/Android hosts as a plain keyboard.
+- **USB**: single HID interface with a composite report descriptor:
+  keyboard = input report ID 1 (8-byte report + ID byte, mods + 6-key
+  array + LED output report), mouse = input report ID 2 (buttons +
+  X/Y/wheel signed int8 + ID byte). Windows enumerates one USB device
+  exposing both a keyboard and a mouse. Because the descriptor uses report
+  IDs, the interface claims **no boot protocol** (`protocol-code = "none"`)
+  — the keyboard does not work in BIOS/UEFI/pre-boot environments.
 - **BLE**: advertises as `VoiceKB` with the NUS service UUID
   (`6E400001-...`). RX `6E400002-...` (write / write-no-resp, encrypted link
   required), TX `6E400003-...` (notify, status bytes). DIS firmware revision
-  string: `vk-1.0`.
+  string: `vk-2.0`.
 - **Typing**: RX bytes are reassembled as a byte stream (robust to any BLE
-  chunking, including a `0x00` escape byte at a chunk boundary) and typed on
-  a US layout at ~15 ms/keystroke. Shift handling for capitals/symbols is
-  done in firmware. `\n` = Enter, `\t` = Tab, `0x08` = Backspace,
-  `0x00`-escaped special keys per the protocol.
+  chunking, including escape sequences split across chunk boundaries) and
+  typed on a US layout at ~15 ms/keystroke. Shift handling for
+  capitals/symbols is done in firmware. `\n` = Enter, `\t` = Tab, `0x08` =
+  Backspace, `0x00`-escaped special keys per the protocol.
+- **Modifiers (v2)**: `0x00 0x81 <mask>` arms sticky modifiers for the next
+  keystroke (then auto-release), `0x00 0x82 <mask>` holds modifiers down
+  (pressed immediately, so they also modify host-side mouse clicks),
+  `0x00 0x83` releases all. The mask is the HID modifier byte. Held and
+  sticky modifiers compose with each other and with the keystroke's own
+  shift handling. A BLE disconnect while modifiers are held releases them
+  on the host.
+- **Mouse (v2)**: `0x00 0x90 <buttons> <dx> <dy> <wheel>` emits a mouse
+  report (report ID 2); buttons bit0 left / bit1 right / bit2 middle, deltas
+  clamped to the descriptor range −127..127. Mouse packets bypass the
+  keystroke rate limit.
 - **Status**: TX notifies `0x01` (busy) while the keystroke queue is being
   typed, `0x00` (idle) when drained. Best effort.
 - **LED** (green LED0): slow blink = advertising, solid = connected.
+  Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
+  report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
+  interface ready, 4 = mouse packet received.
 
 ## Pairing / security
 
@@ -66,8 +86,9 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
   (multi-byte UTF-8 sequences are dropped byte-wise).
 - **USB VID/PID** is `0x1209/0x0001` (pid.codes community VID). The PID is
   not officially registered; fine for personal use, not for distribution.
-- Modifier combos (`Ctrl`/`Alt`/`Gui` + key) are protocol-reserved for v2 and
-  not implemented.
+- **No HID boot protocol**: the composite keyboard+mouse descriptor uses
+  report IDs, so the keyboard is unavailable in BIOS/UEFI and other
+  pre-boot environments that only speak boot protocol.
 - Only one BLE connection at a time (Zephyr default `CONFIG_BT_MAX_CONN=1`).
 - HID output reports (host-driven Num/Caps/Scroll Lock LEDs) are accepted
   but ignored — the dongle LED reflects BLE state instead.
@@ -83,9 +104,9 @@ firmware/
 │   └── nrf52840dongle_nrf52840.overlay   # zephyr,hid-device node
 └── src/
     ├── main.c      # init, LED state machine, pairing button (debounced)
-    ├── usb_kbd.c   # usbd (next stack) setup + boot-protocol HID keyboard
+    ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse
     ├── ble.c       # NUS-compatible GATT service, adv, bonding window, gating
-    ├── typing.c    # RX byte stream -> HID reports, US keymap, rate limit
+    ├── typing.c    # RX byte stream -> HID reports, US keymap, v2 escapes
     └── vkb.h       # internal interfaces
 ```
 

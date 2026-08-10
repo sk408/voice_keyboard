@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
   BACKSPACE,
+  MODIFIER_BITS,
+  MOUSE_BUTTON_LEFT,
+  MOUSE_BUTTON_MIDDLE,
+  MOUSE_BUTTON_RIGHT,
   SPECIAL_KEYS,
   chunkPayload,
   diffEdits,
   encodeEdit,
+  encodeModifierHold,
+  encodeModifierRelease,
+  encodeMouse,
   encodeSpecialKey,
+  encodeStickyArm,
   encodeText,
   parseStatus,
 } from './protocol';
@@ -45,6 +53,46 @@ describe('encodeSpecialKey', () => {
 
   it('covers every key the protocol defines', () => {
     expect(Object.keys(SPECIAL_KEYS)).toHaveLength(10 + 12);
+  });
+});
+
+describe('modifier encodings (v2)', () => {
+  it('sticky-arm is 0x00 0x81 <mask>', () => {
+    expect([...encodeStickyArm(MODIFIER_BITS.ctrl)]).toEqual([0x00, 0x81, 0x01]);
+  });
+
+  it('composes chords into a single bitmask', () => {
+    const mask = MODIFIER_BITS.ctrl | MODIFIER_BITS.shift;
+    expect([...encodeStickyArm(mask)]).toEqual([0x00, 0x81, 0x03]);
+  });
+
+  it('covers the left-hand HID modifier bits', () => {
+    expect(MODIFIER_BITS).toEqual({ ctrl: 0x01, shift: 0x02, alt: 0x04, gui: 0x08 });
+  });
+
+  it('hold is 0x00 0x82 <mask>, release-all is 0x00 0x83', () => {
+    expect([...encodeModifierHold(MODIFIER_BITS.gui)]).toEqual([0x00, 0x82, 0x08]);
+    expect([...encodeModifierRelease()]).toEqual([0x00, 0x83]);
+  });
+});
+
+describe('encodeMouse (v2)', () => {
+  it('emits 0x00 0x90 <buttons> <dx> <dy> <wheel>', () => {
+    expect([...encodeMouse(MOUSE_BUTTON_LEFT, 10, -20, 0)]).toEqual([0x00, 0x90, 0x01, 10, 0xec, 0]);
+  });
+
+  it('encodes negative deltas as two’s complement int8', () => {
+    expect([...encodeMouse(0, -1, -127, -5)]).toEqual([0x00, 0x90, 0, 0xff, 0x81, 0xfb]);
+  });
+
+  it('clamps deltas to the descriptor range -127..127', () => {
+    expect([...encodeMouse(0, 500, -500, 128)]).toEqual([0x00, 0x90, 0, 127, 0x81, 127]);
+  });
+
+  it('button bits are left/right/middle = bit0/bit1/bit2', () => {
+    expect(MOUSE_BUTTON_LEFT).toBe(0x01);
+    expect(MOUSE_BUTTON_RIGHT).toBe(0x02);
+    expect(MOUSE_BUTTON_MIDDLE).toBe(0x04);
   });
 });
 
@@ -119,6 +167,42 @@ describe('chunkPayload', () => {
         if (chunk[i] === 0x00) expect(i + 1).toBeLessThan(chunk.length);
       }
     }
+  });
+
+  it('never splits a 0x90 mouse packet across chunks', () => {
+    // Mouse packet straddling the nominal chunk boundary.
+    const pad = new Uint8Array(8).fill(0x61);
+    const data = new Uint8Array([...pad, ...encodeMouse(1, 2, 3, 4), ...pad, ...encodeMouse(0, -1, -2, 0)]);
+    const chunks = chunkPayload(data, 10);
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] === 0x00 && chunk[i + 1] === 0x90) {
+          // Whole 6-byte packet must be inside this chunk.
+          expect(i + 6).toBeLessThanOrEqual(chunk.length);
+        }
+      }
+    }
+    expect(Uint8Array.from(chunks.flatMap((c) => [...c]))).toEqual(data);
+  });
+
+  it('never splits a 0x81/0x82 modifier sequence across chunks', () => {
+    const pad = new Uint8Array(9).fill(0x61);
+    const data = new Uint8Array([
+      ...pad,
+      ...encodeStickyArm(0x03),
+      ...encodeModifierHold(0x01),
+      ...encodeModifierRelease(),
+      ...pad,
+    ]);
+    const chunks = chunkPayload(data, 10);
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] !== 0x00) continue;
+        const len = chunk[i + 1] === 0x81 || chunk[i + 1] === 0x82 ? 3 : 2;
+        expect(i + len).toBeLessThanOrEqual(chunk.length);
+      }
+    }
+    expect(Uint8Array.from(chunks.flatMap((c) => [...c]))).toEqual(data);
   });
 
   it('round-trips the concatenation', () => {

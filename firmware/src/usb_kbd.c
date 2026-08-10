@@ -1,4 +1,9 @@
-/* Voice Keyboard — USB HID keyboard (next USB device stack).
+/* Voice Keyboard — USB HID composite keyboard + mouse (next USB device stack).
+ *
+ * Single HID interface, one report descriptor with two report IDs:
+ *   ID 1 = keyboard (8-byte boot-style input report + LED output report)
+ *   ID 2 = mouse (buttons + X/Y/wheel, signed relative int8)
+ * The host enumerates one USB device exposing both a keyboard and a mouse.
  *
  * Adapted from Zephyr's samples/subsys/usb/hid-keyboard.
  */
@@ -24,29 +29,133 @@ LOG_MODULE_REGISTER(usb_kbd, LOG_LEVEL_INF);
 #define VKB_USB_PID	0x0001
 #define VKB_USB_MAX_POWER	50 /* bMaxPower, 2 mA units (100 mA) */
 
+#define VKB_REPORT_ID_KBD	1
+#define VKB_REPORT_ID_MOUSE	2
+
 enum kb_report_idx {
-	KB_MOD_KEY = 0,
+	KB_REPORT_ID_IDX = 0,
+	KB_MOD_KEY,
 	KB_RESERVED,
 	KB_KEY_CODE1,
-	KB_REPORT_COUNT = 8,
+	KB_REPORT_COUNT = 9, /* report ID byte + 8-byte keyboard report */
 };
 
-static const uint8_t hid_report_desc[] = HID_KEYBOARD_REPORT_DESC();
+enum ms_report_idx {
+	MS_REPORT_ID_IDX = 0,
+	MS_BUTTONS,
+	MS_DX,
+	MS_DY,
+	MS_WHEEL,
+	MS_REPORT_COUNT = 5, /* report ID byte + 4-byte mouse report */
+};
+
+/*
+ * Composite report descriptor. The item sequences match
+ * HID_KEYBOARD_REPORT_DESC() / HID_MOUSE_REPORT_DESC(3) exactly, with a
+ * HID_REPORT_ID() added at the top of each application collection — the
+ * macros cannot be reused because they open/close their own collections.
+ * The input report sizes this defines (9 and 5 bytes including the ID
+ * byte) must agree byte-exactly with the send paths below; mismatch = the
+ * host silently drops reports.
+ */
+static const uint8_t hid_report_desc[] = {
+	/* Keyboard — input report ID 1: mods, reserved, 6-key array. */
+	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_KEYBOARD),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+		HID_REPORT_ID(VKB_REPORT_ID_KBD),
+		HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP_KEYPAD),
+		/* HID_USAGE_MINIMUM(Keyboard LeftControl) */
+		HID_USAGE_MIN8(0xE0),
+		/* HID_USAGE_MAXIMUM(Keyboard Right GUI) */
+		HID_USAGE_MAX8(0xE7),
+		HID_LOGICAL_MIN8(0),
+		HID_LOGICAL_MAX8(1),
+		HID_REPORT_SIZE(1),
+		HID_REPORT_COUNT(8),
+		/* HID_INPUT(Data,Var,Abs) — modifier byte */
+		HID_INPUT(0x02),
+		HID_REPORT_SIZE(8),
+		HID_REPORT_COUNT(1),
+		/* HID_INPUT(Cnst,Var,Abs) — reserved byte */
+		HID_INPUT(0x03),
+		HID_REPORT_SIZE(1),
+		HID_REPORT_COUNT(5),
+		HID_USAGE_PAGE(HID_USAGE_GEN_LEDS),
+		/* HID_USAGE_MINIMUM(Num Lock) */
+		HID_USAGE_MIN8(1),
+		/* HID_USAGE_MAXIMUM(Kana) */
+		HID_USAGE_MAX8(5),
+		/* HID_OUTPUT(Data,Var,Abs) — LED output report (ID 1) */
+		HID_OUTPUT(0x02),
+		HID_REPORT_SIZE(3),
+		HID_REPORT_COUNT(1),
+		/* HID_OUTPUT(Cnst,Var,Abs) */
+		HID_OUTPUT(0x03),
+		HID_REPORT_SIZE(8),
+		HID_REPORT_COUNT(6),
+		HID_LOGICAL_MIN8(0),
+		HID_LOGICAL_MAX8(101),
+		HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP_KEYPAD),
+		/* HID_USAGE_MIN8(Reserved) */
+		HID_USAGE_MIN8(0),
+		/* HID_USAGE_MAX8(Keyboard Application) */
+		HID_USAGE_MAX8(101),
+		/* HID_INPUT (Data,Ary,Abs) — 6-key rollover array */
+		HID_INPUT(0x00),
+	HID_END_COLLECTION,
+	/* Mouse — input report ID 2: 3 buttons, X/Y/wheel relative int8. */
+	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_MOUSE),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+		HID_REPORT_ID(VKB_REPORT_ID_MOUSE),
+		HID_USAGE(HID_USAGE_GEN_DESKTOP_POINTER),
+		HID_COLLECTION(HID_COLLECTION_PHYSICAL),
+			/* Bits used for button signalling */
+			HID_USAGE_PAGE(HID_USAGE_GEN_BUTTON),
+			HID_USAGE_MIN8(1),
+			HID_USAGE_MAX8(3),
+			HID_LOGICAL_MIN8(0),
+			HID_LOGICAL_MAX8(1),
+			HID_REPORT_SIZE(1),
+			HID_REPORT_COUNT(3),
+			/* HID_INPUT (Data,Var,Abs) */
+			HID_INPUT(0x02),
+			/* Unused bits */
+			HID_REPORT_SIZE(5),
+			HID_REPORT_COUNT(1),
+			/* HID_INPUT (Cnst,Ary,Abs) */
+			HID_INPUT(1),
+			/* X and Y axis, scroll */
+			HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+			HID_USAGE(HID_USAGE_GEN_DESKTOP_X),
+			HID_USAGE(HID_USAGE_GEN_DESKTOP_Y),
+			HID_USAGE(HID_USAGE_GEN_DESKTOP_WHEEL),
+			HID_LOGICAL_MIN8(-127),
+			HID_LOGICAL_MAX8(127),
+			HID_REPORT_SIZE(8),
+			HID_REPORT_COUNT(3),
+			/* HID_INPUT (Data,Var,Rel) */
+			HID_INPUT(0x06),
+		HID_END_COLLECTION,
+	HID_END_COLLECTION,
+};
 
 static const struct device *hid_dev =
 	DEVICE_DT_GET(DT_NODELABEL(hid_dev_0));
 
 /*
- * Report buffer must satisfy the UDC driver alignment contract
+ * Report buffers must satisfy the UDC driver alignment contract
  * (usbd_hid asserts IS_UDC_ALIGNED, but CONFIG_ASSERT is off in this
- * build, so a misaligned buffer would fail silently). A static buffer is
+ * build, so a misaligned buffer would fail silently). Static buffers are
  * safe here: submission is synchronous (this build registers no
  * input_report_done callback, so hid_device_submit_report() blocks until
  * the host has clocked the report out) and there is a single producer
- * (the typing thread). Also serves as the last-report state for
- * kb_get_report().
+ * (the typing thread). They also serve as the last-report state for
+ * hid_get_report().
  */
 UDC_STATIC_BUF_DEFINE(kb_report, KB_REPORT_COUNT);
+UDC_STATIC_BUF_DEFINE(ms_report, MS_REPORT_COUNT);
 
 /* Written by the USBD thread, read by the typing thread. */
 static atomic_t kb_ready;
@@ -68,22 +177,39 @@ static int kb_get_report(const struct device *dev,
 			 const uint8_t type, const uint8_t id, const uint16_t len,
 			 uint8_t *const buf)
 {
-	ARG_UNUSED(dev); ARG_UNUSED(id);
+	const uint8_t *report;
+	uint16_t size;
+
+	ARG_UNUSED(dev);
 
 	/*
-	 * Answer GET_REPORT(INPUT) with the last submitted report. A
-	 * non-positive return stalls the control pipe (usbd_hid maps it
-	 * to a protocol error), which some host HID stacks treat as a
-	 * device malfunction during enumeration/driver start.
+	 * Answer GET_REPORT(INPUT) with the last submitted report for the
+	 * requested ID. With report IDs in the descriptor the buffer must
+	 * include the ID byte, so the static report buffers are returned
+	 * verbatim. A non-positive return stalls the control pipe (usbd_hid
+	 * maps it to a protocol error), which some host HID stacks treat as
+	 * a device malfunction during enumeration/driver start.
 	 */
 	if (type != HID_REPORT_TYPE_INPUT) {
 		return -ENOTSUP;
 	}
 
-	uint16_t n = MIN(len, KB_REPORT_COUNT);
+	switch (id) {
+	case VKB_REPORT_ID_KBD:
+		report = kb_report;
+		size = KB_REPORT_COUNT;
+		break;
+	case VKB_REPORT_ID_MOUSE:
+		report = ms_report;
+		size = MS_REPORT_COUNT;
+		break;
+	default:
+		return -ENOTSUP;
+	}
 
-	memcpy(buf, kb_report, n);
-	return n;
+	size = MIN(len, size);
+	memcpy(buf, report, size);
+	return size;
 }
 
 static int kb_set_report(const struct device *dev,
@@ -227,7 +353,7 @@ int usb_kbd_init(void)
 		}
 	}
 
-	LOG_INF("USB HID keyboard initialized");
+	LOG_INF("USB HID composite keyboard+mouse initialized");
 	return 0;
 
 err:
@@ -250,6 +376,7 @@ int usb_kbd_report(uint8_t mods, uint8_t key)
 	}
 
 	memset(kb_report, 0, KB_REPORT_COUNT);
+	kb_report[KB_REPORT_ID_IDX] = VKB_REPORT_ID_KBD;
 	kb_report[KB_MOD_KEY] = mods;
 	kb_report[KB_KEY_CODE1] = key;
 
@@ -262,6 +389,30 @@ int usb_kbd_report(uint8_t mods, uint8_t key)
 		 */
 		kb_sent_pulse_done = true;
 		app_led_debug(APP_LED_HID_SENT);
+	}
+
+	return ret;
+}
+
+int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel)
+{
+	int ret;
+
+	if (!atomic_get(&kb_ready)) {
+		app_led_debug(APP_LED_HID_FAIL);
+		return -ENOTCONN;
+	}
+
+	/* The descriptor declares logical min/max -127..127. */
+	ms_report[MS_REPORT_ID_IDX] = VKB_REPORT_ID_MOUSE;
+	ms_report[MS_BUTTONS] = buttons;
+	ms_report[MS_DX] = (uint8_t)CLAMP(dx, -127, 127);
+	ms_report[MS_DY] = (uint8_t)CLAMP(dy, -127, 127);
+	ms_report[MS_WHEEL] = (uint8_t)CLAMP(wheel, -127, 127);
+
+	ret = hid_device_submit_report(hid_dev, MS_REPORT_COUNT, ms_report);
+	if (ret) {
+		app_led_debug(APP_LED_HID_FAIL);
 	}
 
 	return ret;

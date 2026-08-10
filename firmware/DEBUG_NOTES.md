@@ -116,6 +116,7 @@ Green LED behavior is unchanged (blink = advertising, solid = connected).
 | 1 × 80 ms blink | NUS **RX write received** — bytes entered the typing queue |
 | 2 × 80 ms blinks | **first HID report clocked out by the host** this session (submit is synchronous in this stack: success means the host actually polled the report off the interrupt IN endpoint) |
 | 3 × 120 ms blinks | **HID submit failed** — keystroke attempted while the interface was not ready, or `hid_device_submit_report()` returned an error |
+| 4 × 60 ms blinks | **mouse packet received** (v2 `0x90`) — full packet parsed and forwarded as a report-ID-2 mouse report |
 
 Reading the chain after sending text from the app:
 

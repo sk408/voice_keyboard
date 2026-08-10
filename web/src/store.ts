@@ -1,10 +1,27 @@
 import { create } from 'zustand';
 import { DongleConnection, describeBleError } from './ble';
-import { encodeEdit, encodeSpecialKey, encodeText, type SpecialKey } from './protocol';
+import {
+  MODIFIER_BITS,
+  encodeEdit,
+  encodeModifierHold,
+  encodeModifierRelease,
+  encodeMouse,
+  encodeSpecialKey,
+  encodeStickyArm,
+  encodeText,
+  type ModifierKey,
+  type SpecialKey,
+} from './protocol';
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 export type TypingMode = 'live' | 'compose';
 export type DongleStatus = 'idle' | 'busy' | 'error';
+
+/** Sticky modifier state: off → armed (next key) → locked (held) → off. */
+export type ModifierState = 'off' | 'armed' | 'locked';
+export type Modifiers = Record<ModifierKey, ModifierState>;
+
+const MODIFIERS_OFF: Modifiers = { ctrl: 'off', shift: 'off', alt: 'off', gui: 'off' };
 
 const MODE_STORAGE_KEY = 'voicekb.mode';
 
@@ -29,6 +46,8 @@ interface AppState {
   mode: TypingMode;
   /** Devices already granted to this origin, for one-tap reconnect. */
   grantedDevices: BluetoothDevice[];
+  /** Sticky/locked modifier state for the keyboard tab. */
+  modifiers: Modifiers;
 
   setMode(mode: TypingMode): void;
   refreshGrantedDevices(): Promise<void>;
@@ -40,6 +59,12 @@ interface AppState {
   /** Live mode: apply an edit from prev to next (backspaces + insert). */
   sendEdit(prev: string, next: string): Promise<void>;
   sendSpecialKey(key: SpecialKey): Promise<void>;
+  /** Cycle a modifier: off → armed → locked → off (sends 0x82/0x83 as needed). */
+  tapModifier(key: ModifierKey): void;
+  /** Release all armed/locked modifiers (sends 0x83 if any were held). */
+  releaseModifiers(): void;
+  /** Mouse tab: one relative mouse packet (0x90). Fire-and-forget. */
+  sendMouse(buttons: number, dx: number, dy: number, wheel: number): void;
   clearError(): void;
 }
 
@@ -72,6 +97,52 @@ export const useAppStore = create<AppState>((set, get) => {
     }
   }
 
+  /** Shared send path: guards connection, drives the badge, maps errors. */
+  async function sendRaw(payload: Uint8Array): Promise<void> {
+    if (!dongle || get().connection !== 'connected') return;
+    try {
+      sendBegin();
+      await dongle.send(payload);
+    } catch (e) {
+      handleSendError(e);
+    } finally {
+      sendEnd();
+    }
+  }
+
+  function lockedMask(mods: Modifiers): number {
+    let mask = 0;
+    for (const key of Object.keys(MODIFIER_BITS) as ModifierKey[]) {
+      if (mods[key] === 'locked') mask |= MODIFIER_BITS[key];
+    }
+    return mask;
+  }
+
+  /**
+   * Prepend a 0x81 sticky-arm sequence when modifiers are armed, and
+   * disarm them: the arm applies to the next keystroke only, so it must
+   * ride in the same payload as that keystroke to survive write queueing.
+   */
+  function withArmedPrefix(payload: Uint8Array): Uint8Array {
+    const mods = get().modifiers;
+    let mask = 0;
+    for (const key of Object.keys(MODIFIER_BITS) as ModifierKey[]) {
+      if (mods[key] === 'armed') mask |= MODIFIER_BITS[key];
+    }
+    if (mask === 0) return payload;
+
+    const next = { ...mods };
+    for (const key of Object.keys(MODIFIER_BITS) as ModifierKey[]) {
+      if (next[key] === 'armed') next[key] = 'off';
+    }
+    set({ modifiers: next });
+
+    const out = new Uint8Array(3 + payload.length);
+    out.set(encodeStickyArm(mask));
+    out.set(payload, 3);
+    return out;
+  }
+
   return {
     bleSupported: DongleConnection.isSupported(),
     connection: 'disconnected',
@@ -82,6 +153,7 @@ export const useAppStore = create<AppState>((set, get) => {
     pairingHint: false,
     mode: loadMode(),
     grantedDevices: [],
+    modifiers: { ...MODIFIERS_OFF },
 
     setMode(mode) {
       set({ mode });
@@ -132,7 +204,13 @@ export const useAppStore = create<AppState>((set, get) => {
           () => {
             if (conn === null || dongle !== conn) return;
             dongle = null;
-            set({ connection: 'disconnected', bonded: false, dongleStatus: 'idle' });
+            set({
+              connection: 'disconnected',
+              bonded: false,
+              dongleStatus: 'idle',
+              // The dongle drops held modifiers on disconnect; mirror that.
+              modifiers: { ...MODIFIERS_OFF },
+            });
           },
         );
         dongle = conn;
@@ -152,7 +230,12 @@ export const useAppStore = create<AppState>((set, get) => {
     disconnect() {
       dongle?.disconnect();
       dongle = null;
-      set({ connection: 'disconnected', bonded: false, dongleStatus: 'idle' });
+      set({
+        connection: 'disconnected',
+        bonded: false,
+        dongleStatus: 'idle',
+        modifiers: { ...MODIFIERS_OFF },
+      });
     },
 
     async forgetDevice() {
@@ -170,41 +253,56 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ error: 'Not connected to a dongle.' });
         return;
       }
-      try {
-        set({ error: null });
-        sendBegin();
-        await dongle.send(encodeText(text));
-      } catch (e) {
-        handleSendError(e);
-      } finally {
-        sendEnd();
-      }
+      set({ error: null });
+      await sendRaw(withArmedPrefix(encodeText(text)));
     },
 
     async sendEdit(prev, next) {
-      if (!dongle || get().connection !== 'connected') return;
       const payload = encodeEdit(prev, next);
       if (payload.length === 0) return;
-      try {
-        sendBegin();
-        await dongle.send(payload);
-      } catch (e) {
-        handleSendError(e);
-      } finally {
-        sendEnd();
-      }
+      await sendRaw(withArmedPrefix(payload));
     },
 
     async sendSpecialKey(key) {
-      if (!dongle || get().connection !== 'connected') return;
-      try {
-        sendBegin();
-        await dongle.send(encodeSpecialKey(key));
-      } catch (e) {
-        handleSendError(e);
-      } finally {
-        sendEnd();
+      await sendRaw(withArmedPrefix(encodeSpecialKey(key)));
+    },
+
+    tapModifier(key) {
+      const mods = get().modifiers;
+      const cur = mods[key];
+
+      if (cur === 'off') {
+        // Arm for the next keystroke; nothing is sent until that key goes out.
+        set({ modifiers: { ...mods, [key]: 'armed' } });
+        return;
       }
+
+      if (cur === 'armed') {
+        // Lock: hold the full locked set (including this key) down.
+        const next: Modifiers = { ...mods, [key]: 'locked' };
+        set({ modifiers: next });
+        void sendRaw(encodeModifierHold(lockedMask(next)));
+        return;
+      }
+
+      // Locked → off: re-hold the remaining set, or release all.
+      const next: Modifiers = { ...mods, [key]: 'off' };
+      set({ modifiers: next });
+      const mask = lockedMask(next);
+      void sendRaw(mask === 0 ? encodeModifierRelease() : encodeModifierHold(mask));
+    },
+
+    releaseModifiers() {
+      const hadLocked = lockedMask(get().modifiers) !== 0;
+      set({ modifiers: { ...MODIFIERS_OFF } });
+      if (hadLocked) void sendRaw(encodeModifierRelease());
+    },
+
+    sendMouse(buttons, dx, dy, wheel) {
+      if (!dongle || get().connection !== 'connected') return;
+      // High-rate path (up to ~50 pkt/s): no busy-badge churn, but send
+      // errors still surface.
+      dongle.send(encodeMouse(buttons, dx, dy, wheel)).catch(handleSendError);
     },
 
     clearError() {

@@ -7,8 +7,13 @@
 	hid_dev_0: hid_dev_0 {
 		compatible = "zephyr,hid-device";
 		interface-name = "HID0";
-		protocol-code = "keyboard";
-		in-report-size = <8>;
+		/* Composite keyboard (report ID 1) + mouse (report ID 2): the
+		 * report descriptor uses report IDs, which is incompatible
+		 * with the HID boot protocol, so no boot protocol is claimed.
+		 */
+		protocol-code = "none";
+		/* Longest input report: keyboard = 1 ID byte + 8 report bytes. */
+		in-report-size = <9>;
 		in-polling-period-us = <1000>;
 	};
 };

@@ -17,15 +17,18 @@ enum app_led_code {
 	APP_LED_HID_SENT,	/* 2 short blinks: host clocked out first report */
 	APP_LED_HID_FAIL,	/* 3 blinks: HID report submit failed/not ready */
 	APP_LED_HID_READY,	/* solid 1 s: host configured the HID interface */
+	APP_LED_MOUSE_RX,	/* 4 short blinks: mouse packet received */
 };
 
 void app_led_debug(enum app_led_code code);
 
-/* --- USB HID keyboard (usb_kbd.c) --- */
+/* --- USB HID composite keyboard + mouse (usb_kbd.c) --- */
 int usb_kbd_init(void);
 bool usb_kbd_ready(void);
-/* Submit one boot-protocol keyboard report (mods + single key, 0 = none). */
+/* Submit one keyboard report (report ID 1: mods + single key, 0 = none). */
 int usb_kbd_report(uint8_t mods, uint8_t key);
+/* Submit one mouse report (report ID 2). Deltas are clamped to [-127, 127]. */
+int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel);
 
 /* --- BLE NUS peripheral (ble.c) --- */
 int ble_init(void);

@@ -34,7 +34,17 @@ Stream of bytes, any chunking; dongle types as received, rate-limited (~15 ms/ke
   - `0x01` Esc, `0x02` Up, `0x03` Down, `0x04` Left, `0x05` Right,
     `0x06` Delete, `0x07` Home, `0x08` End, `0x09` PageUp, `0x0A` PageDown,
     `0x10`–`0x1B` F1–F12
-  - Modifier combos (Ctrl/Alt/Gui+key) reserved for v2 (`0x00 0x80+...`)
+## RX payload — v2 extensions
+
+- **Modifiers** (0x80 range):
+  - `0x00 0x81 <bitmask>` = sticky-arm modifiers for the NEXT key only (then auto-release)
+  - `0x00 0x82 <bitmask>` = hold modifiers down until release
+  - `0x00 0x83` = release all modifiers
+  - Bitmask = HID report byte 0: bit0 LCtrl, bit1 LShift, bit2 LAlt, bit3 LGui,
+    bit4 RCtrl, bit5 RShift, bit6 RAlt, bit7 RGui.
+- **Mouse** (requires the composite HID descriptor; keyboard = report ID 1, mouse = report ID 2):
+  - `0x00 0x90 <buttons> <dx> <dy> <wheel>` — buttons bit0 left/bit1 right/bit2 middle;
+    dx, dy, wheel = signed int8 relative movement. Sent at touch-event rate; firmware clamps per-report deltas to int8 range.
 
 ## TX notifications (status)
 
