@@ -136,7 +136,9 @@ are not migrated — re-pair and re-set the name once.
   Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
   report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
   interface ready, 4 = mouse packet received, 5 = absolute pointer packet
-  received.
+  received, 6 = macro playback started. At boot the red LED also runs a
+  stage trace (1→5 blinks in slow groups: main, USB up, BLE up, settings
+  loaded, advertising up) — the last group seen pinpoints a boot hang.
 
 ## Pairing / security
 

@@ -23,6 +23,8 @@ enum app_led_code {
 };
 
 void app_led_debug(enum app_led_code code);
+/* Boot-stage trace (v5.1): red blink N = boot stage N completed. */
+void app_boot_stage(uint8_t stage);
 
 /* --- USB HID composite keyboard + mouse (usb_kbd.c) --- */
 int usb_kbd_init(void);

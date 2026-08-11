@@ -203,6 +203,51 @@ unescapes `data` at the byte level (printable ASCII, `\"`/`\\`, `\u00XX`
 per raw byte), so chunk boundaries may split UTF-8 characters and escape
 sequences freely. DIS firmware revision is `vk-5.0`.
 
+## v5.1: boot-failure hunt (red LED at plug-in, then nothing)
+
+Symptom on hardware: v5 UF2 flashes fine, but after the bootloader hands off
+there is no green advertising blink and no BLE — death somewhere between
+bootloader handoff and `bt_le_adv_start()`.
+
+Static audit of the v5 delta (`9b7ad61..40b9254`) came up clean: overlay
+partition math verified against `fstab-stock.dtsi` (storage `0xB4000`/32 KB
+fits the carved-down slot1, no overlap; generated `zephyr.dts` confirmed),
+`.config` diff vs a fresh v4 build is exactly five lines (MTU sizes, DIS rev
+string, `FLASH_LOAD_SIZE`), no merge artifacts in `main.c`/`ble.c`/`macro.c`,
+memory report well within limits (FLASH 224 KB/568 KB, RAM 116 KB/256 KB),
+UF2 regenerated at `0x26000`/family `0xada52840`. NVS mount is bounded even
+on garbage flash (fixed-step ATE walk within sector bounds), and the macro
+store's boot path is a no-op on an empty store. The root cause is therefore
+**not statically provable** — it needs one observed boot.
+
+Two changes ship for that:
+
+- **Boot-stage trace on the red LED** (`app_boot_stage()`, called from
+  `main.c`/`ble.c`): N slow blinks (80 ms on/off, 300 ms gap) = stage N
+  completed. The last code seen pinpoints the death stage.
+
+  | Blinks | Stage completed | Hang after it means death in… |
+  |---|---|---|
+  | *(none)* | — | kernel/driver init, before `main()` |
+  | 1 | `main()` entered, LEDs/timer configured | button or USB init |
+  | 2 | USB HID stack up | `bt_enable()` (BLE controller/host) |
+  | 3 | BLE stack up | `settings_load()` / macro-store restore (NVS on the moved partition) |
+  | 4 | settings + macro store loaded | advertising start |
+  | 5 | advertising up | — (normal green blink takes over; boot OK) |
+
+  A healthy boot shows 1→5 in ~4 s, then the usual green advertising blink.
+- **Controller PDU length pinned to the v4 value**
+  (`CONFIG_BT_CTLR_DATA_LENGTH_MAX=27`): in v5 it silently followed
+  `BT_BUF_ACL_RX_SIZE` to 200 (Kconfig default), changing the link layer vs
+  the hardware-verified v4 build. The 180-byte macro chunks only need
+  host-side L2CAP (re)assembly, so DLE 27 costs nothing but upload speed
+  (more, smaller PDUs) and removes the whole controller-behavior delta.
+
+**Final flash budget**: app capped at `0x8E000` (568 KB, currently 224 KB =
+39 %); storage `0xB4000`–`0xBC000` = 32 KB NVS (8 sectors); macro store
+budget 16 KB across 16 slots, leaving 16 KB of NVS headroom for bonds, the
+device name, and GC. RAM 116 KB/256 KB (44 %).
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

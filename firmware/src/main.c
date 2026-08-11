@@ -45,6 +45,28 @@ static void dbg_led_work_handler(struct k_work *work)
 	}
 }
 
+/* Boot-stage trace (v5.1): N slow red blinks = stage N completed, so a
+ * boot hang on the headless dongle is pinpointed by the last code seen.
+ * Codes (execution order, documented in DEBUG_NOTES.md):
+ *   1 = main() entered, 2 = USB HID up, 3 = BLE stack up (bt_enable),
+ *   4 = settings loaded (incl. macro store restore), 5 = advertising up.
+ * No blinks at all = death before main() (kernel/driver init).
+ */
+void app_boot_stage(uint8_t stage)
+{
+	if (dbg_led.port == NULL) {
+		return;
+	}
+
+	for (uint8_t i = 0; i < stage; i++) {
+		gpio_pin_set_dt(&dbg_led, 1);
+		k_msleep(80);
+		gpio_pin_set_dt(&dbg_led, 0);
+		k_msleep(80);
+	}
+	k_msleep(300); /* gap between stage codes */
+}
+
 void app_led_debug(enum app_led_code code)
 {
 	if (dbg_led.port == NULL) {
@@ -221,6 +243,8 @@ int main(void)
 
 	k_timer_start(&led_timer, K_MSEC(500), K_MSEC(500));
 
+	app_boot_stage(1);
+
 	ret = button_init();
 	if (ret) {
 		LOG_ERR("Button init failed (%d), pairing window unusable", ret);
@@ -231,6 +255,8 @@ int main(void)
 		LOG_ERR("USB init failed (%d)", ret);
 		return ret;
 	}
+
+	app_boot_stage(2);
 
 	ret = ble_init();
 	if (ret) {

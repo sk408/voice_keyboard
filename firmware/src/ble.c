@@ -461,12 +461,14 @@ int ble_init(void)
 		LOG_ERR("Bluetooth init failed (%d)", err);
 		return err;
 	}
+	app_boot_stage(3);
 
 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
 		settings_load();
 	}
 	/* Assemble settings-restored macro chunks (no-op when none). */
 	macro_boot_finalize();
+	app_boot_stage(4);
 
 	/* Reflect the (possibly settings-restored) name in the GAP Device
 	 * Name characteristic; advertising data picks it up below.
@@ -481,5 +483,6 @@ int ble_init(void)
 	bt_set_bondable(false);
 
 	start_advertising();
+	app_boot_stage(5);
 	return 0;
 }
