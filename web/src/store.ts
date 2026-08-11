@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { DongleConnection, describeBleError } from './ble';
+import { DEVICE_NAME_STORAGE_KEY, DongleConnection, describeBleError } from './ble';
 import {
   MODIFIER_BITS,
   encodeEdit,
@@ -33,6 +33,22 @@ function loadMode(): TypingMode {
   }
 }
 
+function loadCustomName(): string | null {
+  try {
+    return localStorage.getItem(DEVICE_NAME_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistCustomName(name: string): void {
+  try {
+    localStorage.setItem(DEVICE_NAME_STORAGE_KEY, name);
+  } catch {
+    /* storage unavailable — non-fatal */
+  }
+}
+
 interface AppState {
   bleSupported: boolean;
   connection: ConnectionState;
@@ -40,6 +56,10 @@ interface AppState {
   bonded: boolean;
   dongleStatus: DongleStatus;
   deviceName: string | null;
+  /** Last known dongle advertising name (persisted to localStorage). */
+  customName: string | null;
+  /** False on v2 dongles without the config characteristic. */
+  deviceNameSupported: boolean;
   error: string | null;
   /** Show "press the dongle button to enter pairing mode" guidance. */
   pairingHint: boolean;
@@ -65,6 +85,16 @@ interface AppState {
   releaseModifiers(): void;
   /** Mouse tab: one relative mouse packet (0x90). Fire-and-forget. */
   sendMouse(buttons: number, dx: number, dy: number, wheel: number): void;
+  /** Settings tab: write a new dongle advertising name. True on success. */
+  setDeviceName(name: string): Promise<boolean>;
+  /** Best-effort read of the dongle's current name into customName. */
+  refreshDeviceName(): Promise<void>;
+  /**
+   * Macro runner: send one pre-encoded segment through the paced queue.
+   * Returns false when not connected or the write failed (error is mapped
+   * into the store error state either way).
+   */
+  sendSegment(payload: Uint8Array): Promise<boolean>;
   clearError(): void;
 }
 
@@ -149,6 +179,8 @@ export const useAppStore = create<AppState>((set, get) => {
     bonded: false,
     dongleStatus: 'idle',
     deviceName: null,
+    customName: loadCustomName(),
+    deviceNameSupported: false,
     error: null,
     pairingHint: false,
     mode: loadMode(),
@@ -208,13 +240,20 @@ export const useAppStore = create<AppState>((set, get) => {
               connection: 'disconnected',
               bonded: false,
               dongleStatus: 'idle',
+              deviceNameSupported: false,
               // The dongle drops held modifiers on disconnect; mirror that.
               modifiers: { ...MODIFIERS_OFF },
             });
           },
         );
         dongle = conn;
-        set({ connection: 'connected', bonded: true, dongleStatus: 'idle' });
+        set({
+          connection: 'connected',
+          bonded: true,
+          dongleStatus: 'idle',
+          deviceNameSupported: conn.supportsDeviceName,
+        });
+        void get().refreshDeviceName();
       } catch (e) {
         const { message } = describeBleError(e);
         set({
@@ -234,6 +273,7 @@ export const useAppStore = create<AppState>((set, get) => {
         connection: 'disconnected',
         bonded: false,
         dongleStatus: 'idle',
+        deviceNameSupported: false,
         modifiers: { ...MODIFIERS_OFF },
       });
     },
@@ -243,7 +283,13 @@ export const useAppStore = create<AppState>((set, get) => {
         await dongle?.forget();
       } finally {
         dongle = null;
-        set({ connection: 'disconnected', bonded: false, dongleStatus: 'idle', deviceName: null });
+        set({
+          connection: 'disconnected',
+          bonded: false,
+          dongleStatus: 'idle',
+          deviceName: null,
+          deviceNameSupported: false,
+        });
         await get().refreshGrantedDevices();
       }
     },
@@ -303,6 +349,49 @@ export const useAppStore = create<AppState>((set, get) => {
       // High-rate path (up to ~50 pkt/s): no busy-badge churn, but send
       // errors still surface.
       dongle.send(encodeMouse(buttons, dx, dy, wheel)).catch(handleSendError);
+    },
+
+    async setDeviceName(name) {
+      if (!dongle || get().connection !== 'connected') {
+        set({ error: 'Not connected to a dongle.' });
+        return false;
+      }
+      try {
+        await dongle.writeDeviceName(name);
+        set({ customName: name });
+        persistCustomName(name);
+        return true;
+      } catch (e) {
+        handleSendError(e);
+        return false;
+      }
+    },
+
+    async refreshDeviceName() {
+      if (!dongle || get().connection !== 'connected') return;
+      try {
+        const name = await dongle.readDeviceName();
+        // null → v2 firmware without the config characteristic.
+        if (name === null) return;
+        set({ customName: name });
+        persistCustomName(name);
+      } catch {
+        /* best-effort prefill — a failed read is not worth an error banner */
+      }
+    },
+
+    async sendSegment(payload) {
+      if (!dongle || get().connection !== 'connected') return false;
+      try {
+        sendBegin();
+        await dongle.send(payload);
+        return true;
+      } catch (e) {
+        handleSendError(e);
+        return false;
+      } finally {
+        sendEnd();
+      }
     },
 
     clearError() {

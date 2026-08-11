@@ -7,8 +7,10 @@ import ComposeBox from './components/ComposeBox';
 import ModifierBar from './components/ModifierBar';
 import SpecialKeysBar from './components/SpecialKeysBar';
 import MousePad from './components/MousePad';
+import MacroPanel from './components/MacroPanel';
+import SettingsPanel from './components/SettingsPanel';
 
-type Tab = 'keyboard' | 'mouse';
+type Tab = 'keyboard' | 'macros' | 'mouse' | 'settings';
 
 export default function App() {
   const mode = useAppStore((s) => s.mode);
@@ -47,11 +49,13 @@ export default function App() {
       <StatusBar />
       {/* Tab switch is pure view state: the BLE connection lives in the
           store and neither tab owns it, so switching never disconnects. */}
-      <div className="mode-toggle" role="group" aria-label="Tab">
+      <div className="tab-bar" role="group" aria-label="Tab">
         {tabButton('keyboard', 'Keyboard')}
+        {tabButton('macros', 'Macros')}
         {tabButton('mouse', 'Mouse')}
+        {tabButton('settings', 'Settings')}
       </div>
-      {/* Kept mounted (hidden) while the mouse tab is active so live/compose
+      {/* Kept mounted (hidden) while another tab is active so live/compose
           drafts survive tab switches. */}
       <div className={`tab-panel${tab === 'keyboard' ? '' : ' hidden'}`}>
         <ModeToggle />
@@ -59,7 +63,9 @@ export default function App() {
         <ModifierBar />
         <SpecialKeysBar />
       </div>
+      {tab === 'macros' && <MacroPanel />}
       {tab === 'mouse' && <MousePad />}
+      {tab === 'settings' && <SettingsPanel />}
     </div>
   );
 }

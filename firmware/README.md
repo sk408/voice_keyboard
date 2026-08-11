@@ -39,10 +39,17 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
   exposing both a keyboard and a mouse. Because the descriptor uses report
   IDs, the interface claims **no boot protocol** (`protocol-code = "none"`)
   — the keyboard does not work in BIOS/UEFI/pre-boot environments.
-- **BLE**: advertises as `VoiceKB` with the NUS service UUID
-  (`6E400001-...`). RX `6E400002-...` (write / write-no-resp, encrypted link
-  required), TX `6E400003-...` (notify, status bytes). DIS firmware revision
-  string: `vk-2.0`.
+- **BLE**: advertises as `VoiceKB` (default; user-settable, see below) with
+  the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
+  write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
+  bytes). DIS firmware revision string: `vk-3.0`.
+- **Config characteristic (v3)**: `5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B`
+  (read / write-with-response, encrypted link required) on the same service.
+  Write a UTF-8 device name (1–20 printable ASCII chars) to rename the
+  dongle: it is persisted via the settings subsystem and applied to the GAP
+  Device Name immediately and to the advertising data on the next advertise
+  (after disconnect). Read returns the current name. Invalid names are
+  rejected (`Value Not Allowed`).
 - **Typing**: RX bytes are reassembled as a byte stream (robust to any BLE
   chunking, including escape sequences split across chunk boundaries) and
   typed on a US layout at ~15 ms/keystroke. Shift handling for
@@ -105,7 +112,7 @@ firmware/
 └── src/
     ├── main.c      # init, LED state machine, pairing button (debounced)
     ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse
-    ├── ble.c       # NUS-compatible GATT service, adv, bonding window, gating
+    ├── ble.c       # NUS-compatible GATT service, config char (v3), adv, bonding window, gating
     ├── typing.c    # RX byte stream -> HID reports, US keymap, v2 escapes
     └── vkb.h       # internal interfaces
 ```

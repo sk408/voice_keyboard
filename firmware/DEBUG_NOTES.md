@@ -16,6 +16,10 @@ in this tree. Ordered by likelihood of causing the reported symptom.
 - `attrs[3]` TX CCC
 - `attrs[4]` RX declaration
 - `attrs[5]` RX value
+- (v3) `attrs[6]` config characteristic **declaration**
+- (v3) `attrs[7]` config characteristic **value** — the TX **value** is still
+  `attrs[2]`; the config characteristic is appended after RX, so the fix
+  below is unaffected
 
 `BT_GATT_CHARACTERISTIC` expands to *two* attributes (declaration + value), so
 `attrs[1]` is the declaration, not the value. Notifications went out with the
@@ -132,6 +136,20 @@ Reading the chain after sending text from the app:
 Codes are emitted from `nus_rx_write()` (BT RX context), `kb_iface_ready()`
 and `usb_kbd_report()` (USBD/typing context) via `app_led_debug()` in
 `main.c`, which just reschedules a workqueue item — no blocking in callers.
+
+## v3: config characteristic (device name)
+
+v3 appends a config characteristic (`5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B`,
+read + write-with-response, encrypted link) to the same GATT service. It
+accepts a 1–20 char printable-ASCII device name, persists it as `vkb/name`
+via the settings subsystem (`SETTINGS_STATIC_HANDLER_DEFINE`, restored at
+boot by the existing `settings_load()`), applies it to the GAP Device Name
+via `bt_set_name()` (`CONFIG_BT_DEVICE_NAME_DYNAMIC=y`), and rebuilds the
+advertising complete-name field from it on every advertise start — so a name
+set while connected shows up after the next disconnect, and worst case after
+a reboot. DIS firmware revision is `vk-3.0`. The notify-on-`attrs[2]` fix is
+unaffected: the config characteristic is appended after RX, so the TX value
+attribute index does not move.
 
 ## Not verified here
 

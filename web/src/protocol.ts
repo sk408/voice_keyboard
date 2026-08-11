@@ -10,6 +10,13 @@ export const NUS_RX_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // central �
 export const NUS_TX_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // dongle → central (notify)
 export const ADVERTISED_NAME_PREFIX = 'VoiceKB';
 
+/**
+ * v3 config characteristic (custom, on the NUS-compatible service):
+ * read/write the BLE advertising name (UTF-8, 1–20 printable ASCII chars).
+ * Absent on v2 firmware.
+ */
+export const CONFIG_CHAR_UUID = '5a1b0001-8c4d-4e2f-9a3b-7c6d5e4f3a2b';
+
 /** TX status notification values. */
 export const STATUS_IDLE = 0x00;
 export const STATUS_BUSY = 0x01;

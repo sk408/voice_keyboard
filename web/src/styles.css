@@ -168,6 +168,23 @@ button.secondary {
   background: var(--accent);
 }
 
+/* App tab bar (four big buttons) */
+.tab-bar {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.tab-bar button {
+  background: var(--panel-2);
+  font-weight: 600;
+  padding: 12px 4px;
+}
+
+.tab-bar button.mode-active {
+  background: var(--accent);
+}
+
 /* Input panels */
 .input-panel {
   display: flex;
@@ -342,4 +359,120 @@ button.secondary {
   z-index: 1000;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   white-space: nowrap;
+}
+
+/* Plain text inputs (settings, macro editor) */
+.text-input {
+  font: inherit;
+  font-size: 1.1rem;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--panel-2);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.text-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* Macros tab */
+.macro-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.macro-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.macro-row {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.macro-name {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.macro-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.macro-actions .macro-run {
+  flex: 1;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.macro-actions .macro-small {
+  padding: 12px 10px;
+  font-size: 0.85rem;
+}
+
+.macro-template {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1rem;
+}
+
+.macro-hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.macro-runner {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+.macro-field-label {
+  font-size: 1.3rem;
+  font-weight: 700;
+}
+
+.macro-progress {
+  font-size: 1.1rem;
+  color: var(--muted);
+}
+
+/* Settings tab */
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-section {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-section h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.confirm-banner {
+  background: color-mix(in srgb, var(--ok) 18%, var(--panel));
+  border: 1px solid var(--ok);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.9rem;
 }

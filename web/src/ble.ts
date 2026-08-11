@@ -15,6 +15,7 @@
  */
 import {
   ADVERTISED_NAME_PREFIX,
+  CONFIG_CHAR_UUID,
   NUS_RX_UUID,
   NUS_SERVICE_UUID,
   NUS_TX_UUID,
@@ -28,8 +29,16 @@ export type DisconnectListener = () => void;
 /** Inter-write pacing: firmware types at ~15 ms/keystroke; 20 ms keeps us behind it. */
 const WRITE_DELAY_MS = 20;
 
+/** localStorage key for the user-set dongle advertising name (also read by requestDevice). */
+export const DEVICE_NAME_STORAGE_KEY = 'voicekb.deviceName';
+
+/** Device-name rule shared with firmware: 1–20 printable ASCII chars. */
+const DEVICE_NAME_RE = /^[\x20-\x7e]{1,20}$/;
+
 export class DongleConnection {
   private rx: BluetoothRemoteGATTCharacteristic | null = null;
+  /** v3 config characteristic (device name); null on v2 firmware. */
+  private config: BluetoothRemoteGATTCharacteristic | null = null;
   private queue: Promise<void> = Promise.resolve();
 
   private constructor(private device: BluetoothDevice) {}
@@ -62,12 +71,20 @@ export class DongleConnection {
 
   /** Show the browser chooser, filtered to the NUS service. */
   static async requestDevice(): Promise<BluetoothDevice> {
+    const filters: BluetoothLEScanFilter[] = [{ services: [NUS_SERVICE_UUID] }];
+    // A renamed dongle no longer advertises as "VoiceKB…" — match the
+    // stored custom name too. The services filter above stays primary.
+    let customName: string | null = null;
+    try {
+      customName = localStorage.getItem(DEVICE_NAME_STORAGE_KEY);
+    } catch {
+      /* storage unavailable — non-fatal */
+    }
+    if (customName) filters.push({ namePrefix: customName });
+    filters.push({ namePrefix: ADVERTISED_NAME_PREFIX });
     return navigator.bluetooth.requestDevice({
-      filters: [
-        { services: [NUS_SERVICE_UUID] },
-        { namePrefix: ADVERTISED_NAME_PREFIX },
-      ],
-      optionalServices: [NUS_SERVICE_UUID],
+      filters,
+      optionalServices: [NUS_SERVICE_UUID, CONFIG_CHAR_UUID],
     });
   }
 
@@ -112,6 +129,38 @@ export class DongleConnection {
       const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
       if (value && value.byteLength > 0) onStatus(parseStatus(value));
     });
+
+    // v3 config characteristic (device name). v2 dongles don't have it —
+    // tolerate the absence and leave config null.
+    try {
+      this.config = await service.getCharacteristic(CONFIG_CHAR_UUID);
+    } catch {
+      this.config = null;
+    }
+  }
+
+  /** True when the connected firmware exposes the v3 config characteristic. */
+  get supportsDeviceName(): boolean {
+    return this.config !== null;
+  }
+
+  /** Current dongle advertising name, or null when unsupported (v2 firmware). */
+  async readDeviceName(): Promise<string | null> {
+    if (!this.config || !this.connected) return null;
+    const value = await this.config.readValue();
+    return new TextDecoder().decode(value);
+  }
+
+  /** Persist a new advertising name (1–20 printable ASCII chars). */
+  async writeDeviceName(name: string): Promise<void> {
+    if (!this.config || !this.connected) {
+      throw new Error('This dongle does not support renaming (older firmware).');
+    }
+    if (!DEVICE_NAME_RE.test(name)) {
+      throw new Error('Name must be 1–20 printable ASCII characters.');
+    }
+    // Fresh copy typed against ArrayBuffer (TS 5.7+ BufferSource generics).
+    await this.config.writeValueWithResponse(new Uint8Array(new TextEncoder().encode(name)));
   }
 
   private onDisconnect: DisconnectListener = () => {};
@@ -121,6 +170,7 @@ export class DongleConnection {
     // swapped in a new instance.
     this.device.removeEventListener('gattserverdisconnected', this.handleDisconnect);
     this.rx = null;
+    this.config = null;
     this.onDisconnect();
   };
 
