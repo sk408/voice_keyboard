@@ -67,6 +67,9 @@ void app_led_debug(enum app_led_code code)
 	case APP_LED_MOUSE_RX:
 		dbg_on_ms = 60; dbg_off_ms = 60; dbg_pulses = 4;
 		break;
+	case APP_LED_ABS_RX:
+		dbg_on_ms = 60; dbg_off_ms = 60; dbg_pulses = 5;
+		break;
 	default:
 		return;
 	}

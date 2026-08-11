@@ -11,24 +11,43 @@
  *                                        → SPECIAL_KEYS escape sequences
  *   {ctrl+x} {ctrl+shift+t} {alt+f4}     → encodeStickyArm(mask) + key encoding
  *   {{field name}}                       → fill-in field (double braces)
+ *   {click 80% 90%}                      → left-click at that percent of the actual
+ *                                          screen (via the calibration map)
+ *   {click "Save button"}                → left-click at a saved landmark (name
+ *                                          matching is case-insensitive)
+ *
+ * Click tokens encode as an absolute-pointer press+release pair (v4
+ * protocol); an unresolvable landmark encodes as zero bytes, never a throw.
  *
  * Unknown or malformed `{...}` tokens are kept as literal text — a macro must
  * never crash and never silently drop user text.
  */
 import {
   MODIFIER_BITS,
+  encodeAbsolute,
   encodeSpecialKey,
   encodeStickyArm,
   encodeText,
   type ModifierKey,
   type SpecialKey,
 } from './protocol';
+import { IDENTITY_MAP, screenFractionToNorm, type CalibrationMap } from './calibration';
+
+export type ClickTarget =
+  | { kind: 'percent'; fx: number; fy: number }
+  | { kind: 'landmark'; name: string };
+
+export interface ClickContext {
+  map?: CalibrationMap; // default IDENTITY_MAP
+  landmark?: (name: string) => { x: number; y: number } | undefined;
+}
 
 export type MacroSegment =
   | { type: 'text'; text: string }
   | { type: 'key'; key: SpecialKey }
   | { type: 'byte'; byte: number }
   | { type: 'chord'; mask: number; target: ChordTarget }
+  | { type: 'click'; target: ClickTarget }
   | { type: 'field'; name: string };
 
 export type ChordTarget =
@@ -96,12 +115,32 @@ function chordTarget(name: string): ChordTarget | null {
 }
 
 /**
+ * Parse a `{click ...}` token. The `click` keyword is case-insensitive;
+ * percent values are 0..100 (decimals allowed), landmark names keep their
+ * case inside the quotes (matching at encode time is case-insensitive).
+ */
+function parseClick(inner: string): MacroSegment | null {
+  const percent = /^click\s+(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)%$/i.exec(inner);
+  if (percent) {
+    const fx = Number(percent[1]);
+    const fy = Number(percent[2]);
+    if (fx > 100 || fy > 100) return null;
+    return { type: 'click', target: { kind: 'percent', fx, fy } };
+  }
+  const landmark = /^click\s+"([^"]+)"$/i.exec(inner);
+  if (landmark) return { type: 'click', target: { kind: 'landmark', name: landmark[1] } };
+  return null;
+}
+
+/**
  * Parse the inside of a single-brace token. Returns null for unknown or
  * malformed content — the caller then keeps the raw `{...}` as literal text.
  */
 function parseToken(raw: string): MacroSegment | null {
-  const inner = raw.trim().toLowerCase();
-  if (!inner) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/^click\s/i.test(trimmed) || /^click$/i.test(trimmed)) return parseClick(trimmed);
+  const inner = trimmed.toLowerCase();
   if (!inner.includes('+')) return lookupSimple(inner);
 
   const parts = inner.split('+').map((p) => p.trim());
@@ -196,8 +235,25 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/** Click = absolute-pointer press then release at the spot (left button). */
+function encodeClick(target: ClickTarget, ctx: ClickContext): Uint8Array {
+  let pos: { x: number; y: number } | undefined;
+  if (target.kind === 'percent') {
+    pos = screenFractionToNorm(ctx.map ?? IDENTITY_MAP, target.fx / 100, target.fy / 100);
+  } else {
+    // No resolver or unknown landmark: encode nothing — never throw.
+    pos = ctx.landmark?.(target.name);
+    if (!pos) return new Uint8Array(0);
+  }
+  return concatBytes([encodeAbsolute(0x01, pos.x, pos.y), encodeAbsolute(0, pos.x, pos.y)]);
+}
+
 /** Encode one segment; a missing field value encodes as empty text. */
-export function encodeSegment(segment: MacroSegment, values: Record<string, string> = {}): Uint8Array {
+export function encodeSegment(
+  segment: MacroSegment,
+  values: Record<string, string> = {},
+  ctx: ClickContext = {},
+): Uint8Array {
   switch (segment.type) {
     case 'text':
       return encodeText(segment.text);
@@ -210,10 +266,16 @@ export function encodeSegment(segment: MacroSegment, values: Record<string, stri
     case 'chord':
       // Sticky arm auto-releases after one keystroke (v2 protocol).
       return concatBytes([encodeStickyArm(segment.mask), encodeChordTarget(segment.target)]);
+    case 'click':
+      return encodeClick(segment.target, ctx);
   }
 }
 
 /** Full template → protocol bytes, fields substituted from `values`. */
-export function encodeMacro(template: string, values: Record<string, string> = {}): Uint8Array {
-  return concatBytes(tokenizeMacro(template).map((s) => encodeSegment(s, values)));
+export function encodeMacro(
+  template: string,
+  values: Record<string, string> = {},
+  ctx: ClickContext = {},
+): Uint8Array {
+  return concatBytes(tokenizeMacro(template).map((s) => encodeSegment(s, values, ctx)));
 }

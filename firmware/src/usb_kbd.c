@@ -1,9 +1,11 @@
-/* Voice Keyboard — USB HID composite keyboard + mouse (next USB device stack).
+/* Voice Keyboard — USB HID composite keyboard + mouse + absolute pointer
+ * (next USB device stack).
  *
- * Single HID interface, one report descriptor with two report IDs:
+ * Single HID interface, one report descriptor with three report IDs:
  *   ID 1 = keyboard (8-byte boot-style input report + LED output report)
  *   ID 2 = mouse (buttons + X/Y/wheel, signed relative int8)
- * The host enumerates one USB device exposing both a keyboard and a mouse.
+ *   ID 3 = absolute pointer (digitizer-class: buttons + X/Y uint16, 0..32767)
+ * The host enumerates one USB device exposing all three functions.
  *
  * Adapted from Zephyr's samples/subsys/usb/hid-keyboard.
  */
@@ -31,6 +33,7 @@ LOG_MODULE_REGISTER(usb_kbd, LOG_LEVEL_INF);
 
 #define VKB_REPORT_ID_KBD	1
 #define VKB_REPORT_ID_MOUSE	2
+#define VKB_REPORT_ID_ABS	3
 
 enum kb_report_idx {
 	KB_REPORT_ID_IDX = 0,
@@ -49,12 +52,22 @@ enum ms_report_idx {
 	MS_REPORT_COUNT = 5, /* report ID byte + 4-byte mouse report */
 };
 
+enum ab_report_idx {
+	AB_REPORT_ID_IDX = 0,
+	AB_BUTTONS,
+	AB_X_LO,
+	AB_X_HI,
+	AB_Y_LO,
+	AB_Y_HI,
+	AB_REPORT_COUNT = 6, /* report ID byte + 5-byte absolute pointer report */
+};
+
 /*
  * Composite report descriptor. The item sequences match
  * HID_KEYBOARD_REPORT_DESC() / HID_MOUSE_REPORT_DESC(3) exactly, with a
  * HID_REPORT_ID() added at the top of each application collection — the
  * macros cannot be reused because they open/close their own collections.
- * The input report sizes this defines (9 and 5 bytes including the ID
+ * The input report sizes this defines (9, 5 and 6 bytes including the ID
  * byte) must agree byte-exactly with the send paths below; mismatch = the
  * host silently drops reports.
  */
@@ -139,6 +152,46 @@ static const uint8_t hid_report_desc[] = {
 			HID_INPUT(0x06),
 		HID_END_COLLECTION,
 	HID_END_COLLECTION,
+	/* Absolute pointer — input report ID 3: 3 buttons, X/Y absolute
+	 * uint16 0..32767 (digitizer-class; the host maps the logical
+	 * extent linearly to the screen).
+	 */
+	/* HID Usage Page (Digitizer 0x0D) — no Zephyr constant */
+	HID_USAGE_PAGE(0x0D),
+	/* HID_USAGE(Touch Screen 0x04) */
+	HID_USAGE(0x04),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+		HID_REPORT_ID(VKB_REPORT_ID_ABS),
+		/* HID_USAGE(Finger 0x22) */
+		HID_USAGE(0x22),
+		HID_COLLECTION(HID_COLLECTION_LOGICAL),
+			/* Bits used for button signalling */
+			HID_USAGE_PAGE(HID_USAGE_GEN_BUTTON),
+			HID_USAGE_MIN8(1),
+			HID_USAGE_MAX8(3),
+			HID_LOGICAL_MIN8(0),
+			HID_LOGICAL_MAX8(1),
+			HID_REPORT_SIZE(1),
+			HID_REPORT_COUNT(3),
+			/* HID_INPUT (Data,Var,Abs) */
+			HID_INPUT(0x02),
+			/* Unused bits */
+			HID_REPORT_SIZE(5),
+			HID_REPORT_COUNT(1),
+			/* HID_INPUT (Cnst,Var,Abs) */
+			HID_INPUT(0x03),
+			/* X and Y axis, absolute */
+			HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+			HID_USAGE(HID_USAGE_GEN_DESKTOP_X),
+			HID_USAGE(HID_USAGE_GEN_DESKTOP_Y),
+			HID_LOGICAL_MIN16(0, 0),
+			HID_LOGICAL_MAX16(0xFF, 0x7F), /* 32767 */
+			HID_REPORT_SIZE(16),
+			HID_REPORT_COUNT(2),
+			/* HID_INPUT (Data,Var,Abs) */
+			HID_INPUT(0x02),
+		HID_END_COLLECTION,
+	HID_END_COLLECTION,
 };
 
 static const struct device *hid_dev =
@@ -156,6 +209,7 @@ static const struct device *hid_dev =
  */
 UDC_STATIC_BUF_DEFINE(kb_report, KB_REPORT_COUNT);
 UDC_STATIC_BUF_DEFINE(ms_report, MS_REPORT_COUNT);
+UDC_STATIC_BUF_DEFINE(ab_report, AB_REPORT_COUNT);
 
 /* Written by the USBD thread, read by the typing thread. */
 static atomic_t kb_ready;
@@ -202,6 +256,10 @@ static int kb_get_report(const struct device *dev,
 	case VKB_REPORT_ID_MOUSE:
 		report = ms_report;
 		size = MS_REPORT_COUNT;
+		break;
+	case VKB_REPORT_ID_ABS:
+		report = ab_report;
+		size = AB_REPORT_COUNT;
 		break;
 	default:
 		return -ENOTSUP;
@@ -411,6 +469,31 @@ int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel)
 	ms_report[MS_WHEEL] = (uint8_t)CLAMP(wheel, -127, 127);
 
 	ret = hid_device_submit_report(hid_dev, MS_REPORT_COUNT, ms_report);
+	if (ret) {
+		app_led_debug(APP_LED_HID_FAIL);
+	}
+
+	return ret;
+}
+
+int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y)
+{
+	int ret;
+
+	if (!atomic_get(&kb_ready)) {
+		app_led_debug(APP_LED_HID_FAIL);
+		return -ENOTCONN;
+	}
+
+	/* The descriptor declares logical min/max 0..32767; x/y are uint16. */
+	ab_report[AB_REPORT_ID_IDX] = VKB_REPORT_ID_ABS;
+	ab_report[AB_BUTTONS] = buttons;
+	ab_report[AB_X_LO] = (uint8_t)x;
+	ab_report[AB_X_HI] = (uint8_t)(x >> 8);
+	ab_report[AB_Y_LO] = (uint8_t)y;
+	ab_report[AB_Y_HI] = (uint8_t)(y >> 8);
+
+	ret = hid_device_submit_report(hid_dev, AB_REPORT_COUNT, ab_report);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
 	}

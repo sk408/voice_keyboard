@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { encodeMacro, encodeSegment, macroFields, tokenizeMacro } from './macros';
+import { encodeMacro, encodeSegment, macroFields, tokenizeMacro, type ClickContext } from './macros';
 import { MODIFIER_BITS, encodeText } from './protocol';
+import type { CalibrationMap } from './calibration';
 
 describe('tokenizeMacro', () => {
   it('keeps plain text as a single text segment', () => {
@@ -77,6 +78,32 @@ describe('tokenizeMacro', () => {
       { type: 'chord', mask: MODIFIER_BITS.ctrl, target: { type: 'char', char: 's' } },
     ]);
   });
+
+  it('parses {click X% Y%} percent tokens, case-insensitive with flexible whitespace', () => {
+    expect(tokenizeMacro('{click 80% 90%}')).toEqual([
+      { type: 'click', target: { kind: 'percent', fx: 80, fy: 90 } },
+    ]);
+    expect(tokenizeMacro('{ CLICK  12.5%   0% }')).toEqual([
+      { type: 'click', target: { kind: 'percent', fx: 12.5, fy: 0 } },
+    ]);
+  });
+
+  it('parses {click "name"} landmark tokens, keeping the quoted case', () => {
+    expect(tokenizeMacro('{click "Save button"}')).toEqual([
+      { type: 'click', target: { kind: 'landmark', name: 'Save button' } },
+    ]);
+    expect(tokenizeMacro('{CLICK "Tray"}')).toEqual([
+      { type: 'click', target: { kind: 'landmark', name: 'Tray' } },
+    ]);
+  });
+
+  it('keeps malformed click tokens as literal text', () => {
+    expect(tokenizeMacro('{click 80}')).toEqual([{ type: 'text', text: '{click 80}' }]);
+    expect(tokenizeMacro('{click 80%}')).toEqual([{ type: 'text', text: '{click 80%}' }]);
+    expect(tokenizeMacro('{click 101% 50%}')).toEqual([{ type: 'text', text: '{click 101% 50%}' }]);
+    expect(tokenizeMacro('{click "unclosed}')).toEqual([{ type: 'text', text: '{click "unclosed}' }]);
+    expect(tokenizeMacro('{click}')).toEqual([{ type: 'text', text: '{click}' }]);
+  });
 });
 
 describe('macroFields', () => {
@@ -131,5 +158,55 @@ describe('encodeMacro / encodeSegment', () => {
 
   it('encodeSegment encodes a single field with its value', () => {
     expect([...encodeSegment({ type: 'field', name: 'n' }, { n: 'x' })]).toEqual([0x78]);
+  });
+});
+
+describe('click tokens (v4)', () => {
+  // round(0.8 * 32767) = 26214 = 0x6666; round(0.9 * 32767) = 29490 = 0x7332
+  const click8090 = [
+    0x00, 0x91, 0x01, 0x66, 0x66, 0x32, 0x73, // press (left button)
+    0x00, 0x91, 0x00, 0x66, 0x66, 0x32, 0x73, // release
+  ];
+
+  it('encodes a percent click with the identity map as press + release', () => {
+    expect([...encodeMacro('{click 80% 90%}')]).toEqual(click8090);
+  });
+
+  it('applies a non-identity calibration map to percent clicks', () => {
+    const map: CalibrationMap = { minX: 8192, maxX: 24576, minY: 0, maxY: 32767 };
+    // fx=0.5 → 8192 + 0.5*16384 = 16384 = 0x4000; fy=1 → 32767 = 0x7fff
+    expect([...encodeMacro('{click 50% 100%}', {}, { map })]).toEqual([
+      0x00, 0x91, 0x01, 0x00, 0x40, 0xff, 0x7f,
+      0x00, 0x91, 0x00, 0x00, 0x40, 0xff, 0x7f,
+    ]);
+  });
+
+  it('resolves landmark clicks through ctx.landmark, case-insensitively', () => {
+    const landmarks = [{ name: 'Save button', x: 100, y: 200 }];
+    const ctx: ClickContext = {
+      landmark: (name) => landmarks.find((l) => l.name.toLowerCase() === name.toLowerCase()),
+    };
+    expect([...encodeMacro('{click "save button"}', {}, ctx)]).toEqual([
+      0x00, 0x91, 0x01, 100, 0, 200, 0,
+      0x00, 0x91, 0x00, 100, 0, 200, 0,
+    ]);
+  });
+
+  it('encodes an unresolved landmark as zero bytes, never a throw', () => {
+    const ctx: ClickContext = { landmark: () => undefined };
+    expect(encodeMacro('{click "missing"}', {}, ctx)).toHaveLength(0);
+    expect(encodeMacro('{click "no resolver"}')).toHaveLength(0);
+  });
+
+  it('keeps malformed click tokens as literal text bytes', () => {
+    expect([...encodeMacro('{click 80}')]).toEqual([...encodeText('{click 80}')]);
+  });
+
+  it('mixes text, click and chord in one template', () => {
+    expect([...encodeMacro('Go{click 80% 90%}{ctrl+s}')]).toEqual([
+      ...encodeText('Go'),
+      ...click8090,
+      0x00, 0x81, 0x01, 0x73, // sticky-arm ctrl + 's'
+    ]);
   });
 });

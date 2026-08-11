@@ -350,6 +350,83 @@ button.secondary {
   background: var(--accent);
 }
 
+/* Mouse tab: pad + dedicated scroll strip side by side */
+.mouse-row {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+}
+
+.mouse-row .trackpad {
+  min-height: 320px;
+}
+
+.scroll-strip {
+  width: 64px;
+  flex: none;
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: ns-resize;
+}
+
+.scroll-strip-hint {
+  writing-mode: vertical-rl;
+}
+
+.mouse-mode-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* Calibration wizard */
+.wizard-panel {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+}
+
+.wizard-title {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.wizard-pad {
+  flex: none;
+  min-height: 220px;
+}
+
+.wizard-corner {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* Landmarks (Mouse tab) */
+.landmarks-panel {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.landmarks-panel h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
 /* Service worker update banner */
 .update-banner {
   position: fixed;

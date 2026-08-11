@@ -8,6 +8,7 @@ import {
   SPECIAL_KEYS,
   chunkPayload,
   diffEdits,
+  encodeAbsolute,
   encodeEdit,
   encodeModifierHold,
   encodeModifierRelease,
@@ -134,6 +135,26 @@ describe('encodeEdit', () => {
   });
 });
 
+describe('encodeAbsolute (v4)', () => {
+  it('emits 0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo> <y_hi>', () => {
+    expect([...encodeAbsolute(0x01, 0x1234, 0x5678)]).toEqual([
+      0x00, 0x91, 0x01, 0x34, 0x12, 0x78, 0x56,
+    ]);
+  });
+
+  it('rounds fractional coordinates', () => {
+    expect([...encodeAbsolute(0, 100.4, 100.6)]).toEqual([0x00, 0x91, 0, 100, 0, 101, 0]);
+  });
+
+  it('clamps out-of-range coordinates to 0..32767', () => {
+    expect([...encodeAbsolute(0, -5, 40000)]).toEqual([0x00, 0x91, 0, 0, 0, 0xff, 0x7f]);
+  });
+
+  it('button bits are left/right/middle = bit0/bit1/bit2', () => {
+    expect(encodeAbsolute(0x07, 0, 0)[2]).toBe(0x07);
+  });
+});
+
 describe('chunkPayload', () => {
   it('returns a single chunk for small payloads', () => {
     const chunks = chunkPayload(bytes(1, 2, 3), 20);
@@ -183,6 +204,35 @@ describe('chunkPayload', () => {
       }
     }
     expect(Uint8Array.from(chunks.flatMap((c) => [...c]))).toEqual(data);
+  });
+
+  it('never splits a 0x91 absolute-pointer packet across chunks', () => {
+    // Text mixed with absolute-pointer packets at awkward offsets.
+    const pad = new Uint8Array(8).fill(0x61);
+    const data = new Uint8Array([
+      ...pad,
+      ...encodeAbsolute(1, 12345, 6789),
+      ...encodeText('abc'),
+      ...encodeAbsolute(0, 0, 32767),
+      ...pad,
+    ]);
+    for (let size = 7; size <= 20; size++) {
+      const chunks = chunkPayload(data, size);
+      for (const chunk of chunks) {
+        for (let i = 0; i < chunk.length; i++) {
+          if (chunk[i] === 0x00 && chunk[i + 1] === 0x91) {
+            // Whole 7-byte packet must be inside this chunk.
+            expect(i + 7).toBeLessThanOrEqual(chunk.length);
+          }
+        }
+      }
+      expect(Uint8Array.from(chunks.flatMap((c) => [...c]))).toEqual(data);
+    }
+  });
+
+  it('rejects chunk sizes smaller than the longest escape sequence', () => {
+    expect(() => chunkPayload(bytes(1, 2, 3), 6)).toThrow(/too small/);
+    expect(() => chunkPayload(bytes(1, 2, 3), 7)).not.toThrow();
   });
 
   it('never splits a 0x81/0x82 modifier sequence across chunks', () => {

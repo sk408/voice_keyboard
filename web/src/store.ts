@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { DEVICE_NAME_STORAGE_KEY, DongleConnection, describeBleError } from './ble';
 import {
   MODIFIER_BITS,
+  MOUSE_BUTTON_LEFT,
+  encodeAbsolute,
   encodeEdit,
   encodeModifierHold,
   encodeModifierRelease,
@@ -12,10 +14,24 @@ import {
   type ModifierKey,
   type SpecialKey,
 } from './protocol';
+import {
+  IDENTITY_MAP,
+  loadCalibration,
+  saveCalibration,
+  type CalibrationMap,
+} from './calibration';
+import {
+  deleteLandmark,
+  loadLandmarks,
+  saveLandmark,
+  type Landmark,
+} from './landmarks';
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 export type TypingMode = 'live' | 'compose';
 export type DongleStatus = 'idle' | 'busy' | 'error';
+/** One-finger trackpad behavior (v4): tablet-style absolute or classic relative. */
+export type OneFingerMode = 'absolute' | 'relative';
 
 /** Sticky modifier state: off → armed (next key) → locked (held) → off. */
 export type ModifierState = 'off' | 'armed' | 'locked';
@@ -24,12 +40,21 @@ export type Modifiers = Record<ModifierKey, ModifierState>;
 const MODIFIERS_OFF: Modifiers = { ctrl: 'off', shift: 'off', alt: 'off', gui: 'off' };
 
 const MODE_STORAGE_KEY = 'voicekb.mode';
+const ONE_FINGER_STORAGE_KEY = 'voicekb.onefinger';
 
 function loadMode(): TypingMode {
   try {
     return localStorage.getItem(MODE_STORAGE_KEY) === 'compose' ? 'compose' : 'live';
   } catch {
     return 'live';
+  }
+}
+
+function loadOneFinger(): OneFingerMode {
+  try {
+    return localStorage.getItem(ONE_FINGER_STORAGE_KEY) === 'relative' ? 'relative' : 'absolute';
+  } catch {
+    return 'absolute';
   }
 }
 
@@ -68,6 +93,14 @@ interface AppState {
   grantedDevices: BluetoothDevice[];
   /** Sticky/locked modifier state for the keyboard tab. */
   modifiers: Modifiers;
+  /** Last absolute pointer position sent (normalized 0..32767 coords). */
+  lastAbsolute: { x: number; y: number } | null;
+  /** One-finger trackpad mode (persisted to localStorage). */
+  defaultOneFinger: OneFingerMode;
+  /** Calibration map for the current device (IDENTITY_MAP until calibrated). */
+  calibration: CalibrationMap;
+  /** Landmarks for the current device. */
+  landmarks: Landmark[];
 
   setMode(mode: TypingMode): void;
   refreshGrantedDevices(): Promise<void>;
@@ -85,6 +118,19 @@ interface AppState {
   releaseModifiers(): void;
   /** Mouse tab: one relative mouse packet (0x90). Fire-and-forget. */
   sendMouse(buttons: number, dx: number, dy: number, wheel: number): void;
+  /** Mouse tab: one absolute pointer packet (0x91). Fire-and-forget; records lastAbsolute. */
+  sendAbsolute(buttons: number, x: number, y: number): void;
+  /** Persist the one-finger trackpad mode. */
+  setDefaultOneFinger(mode: OneFingerMode): void;
+  /** Key used for per-device persisted data (calibration, landmarks). */
+  deviceKey(): string;
+  /** Persist and activate a new calibration map for the current device. */
+  setCalibration(map: CalibrationMap): void;
+  /** Save the last-sent absolute position as a named landmark. False when no position known. */
+  saveCurrentSpot(name: string): boolean;
+  /** Teleport to a landmark (and optionally left-click at the spot). */
+  goToLandmark(name: string, click?: boolean): void;
+  removeLandmark(name: string): void;
   /** Settings tab: write a new dongle advertising name. True on success. */
   setDeviceName(name: string): Promise<boolean>;
   /** Best-effort read of the dongle's current name into customName. */
@@ -148,6 +194,15 @@ export const useAppStore = create<AppState>((set, get) => {
     return mask;
   }
 
+  /** Load per-device persisted state (calibration, landmarks) into the store. */
+  function loadDeviceState(): void {
+    const key = get().deviceKey();
+    set({
+      calibration: loadCalibration(key) ?? IDENTITY_MAP,
+      landmarks: loadLandmarks(key),
+    });
+  }
+
   /**
    * Prepend a 0x81 sticky-arm sequence when modifiers are armed, and
    * disarm them: the arm applies to the next keystroke only, so it must
@@ -173,19 +228,26 @@ export const useAppStore = create<AppState>((set, get) => {
     return out;
   }
 
+  const initialCustomName = loadCustomName();
+  const initialDeviceKey = initialCustomName ?? 'default';
+
   return {
     bleSupported: DongleConnection.isSupported(),
     connection: 'disconnected',
     bonded: false,
     dongleStatus: 'idle',
     deviceName: null,
-    customName: loadCustomName(),
+    customName: initialCustomName,
     deviceNameSupported: false,
     error: null,
     pairingHint: false,
     mode: loadMode(),
     grantedDevices: [],
     modifiers: { ...MODIFIERS_OFF },
+    lastAbsolute: null,
+    defaultOneFinger: loadOneFinger(),
+    calibration: loadCalibration(initialDeviceKey) ?? IDENTITY_MAP,
+    landmarks: loadLandmarks(initialDeviceKey),
 
     setMode(mode) {
       set({ mode });
@@ -194,6 +256,19 @@ export const useAppStore = create<AppState>((set, get) => {
       } catch {
         /* storage unavailable — non-fatal */
       }
+    },
+
+    setDefaultOneFinger(mode) {
+      set({ defaultOneFinger: mode });
+      try {
+        localStorage.setItem(ONE_FINGER_STORAGE_KEY, mode);
+      } catch {
+        /* storage unavailable — non-fatal */
+      }
+    },
+
+    deviceKey() {
+      return get().customName ?? get().deviceName ?? 'default';
     },
 
     async refreshGrantedDevices() {
@@ -253,6 +328,7 @@ export const useAppStore = create<AppState>((set, get) => {
           dongleStatus: 'idle',
           deviceNameSupported: conn.supportsDeviceName,
         });
+        loadDeviceState();
         void get().refreshDeviceName();
       } catch (e) {
         const { message } = describeBleError(e);
@@ -351,6 +427,44 @@ export const useAppStore = create<AppState>((set, get) => {
       dongle.send(encodeMouse(buttons, dx, dy, wheel)).catch(handleSendError);
     },
 
+    sendAbsolute(buttons, x, y) {
+      if (!dongle || get().connection !== 'connected') return;
+      // Same high-rate fire-and-forget path as sendMouse; every call also
+      // records the last known cursor position (for "save current spot" and
+      // the calibration wizard's corner samples).
+      set({ lastAbsolute: { x, y } });
+      dongle.send(encodeAbsolute(buttons, x, y)).catch(handleSendError);
+    },
+
+    setCalibration(map) {
+      saveCalibration(get().deviceKey(), map);
+      set({ calibration: map });
+    },
+
+    saveCurrentSpot(name) {
+      const spot = get().lastAbsolute;
+      const trimmed = name.trim();
+      if (!spot || !trimmed) return false;
+      set({
+        landmarks: saveLandmark(get().deviceKey(), { name: trimmed, x: spot.x, y: spot.y }),
+      });
+      return true;
+    },
+
+    goToLandmark(name, click = false) {
+      const lm = get().landmarks.find((l) => l.name === name);
+      if (!lm) return;
+      get().sendAbsolute(0, lm.x, lm.y);
+      if (click) {
+        get().sendAbsolute(MOUSE_BUTTON_LEFT, lm.x, lm.y);
+        window.setTimeout(() => get().sendAbsolute(0, lm.x, lm.y), 60);
+      }
+    },
+
+    removeLandmark(name) {
+      set({ landmarks: deleteLandmark(get().deviceKey(), name) });
+    },
+
     async setDeviceName(name) {
       if (!dongle || get().connection !== 'connected') {
         set({ error: 'Not connected to a dongle.' });
@@ -373,8 +487,12 @@ export const useAppStore = create<AppState>((set, get) => {
         const name = await dongle.readDeviceName();
         // null → v2 firmware without the config characteristic.
         if (name === null) return;
+        const prevKey = get().deviceKey();
         set({ customName: name });
         persistCustomName(name);
+        // The device key follows the dongle's name — reload per-device state
+        // when the read changes which key we're under.
+        if (get().deviceKey() !== prevKey) loadDeviceState();
       } catch {
         /* best-effort prefill — a failed read is not worth an error banner */
       }

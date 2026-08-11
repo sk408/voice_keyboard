@@ -7,6 +7,7 @@ import ComposeBox from './components/ComposeBox';
 import ModifierBar from './components/ModifierBar';
 import SpecialKeysBar from './components/SpecialKeysBar';
 import MousePad from './components/MousePad';
+import LandmarksPanel from './components/LandmarksPanel';
 import MacroPanel from './components/MacroPanel';
 import SettingsPanel from './components/SettingsPanel';
 
@@ -64,7 +65,12 @@ export default function App() {
         <SpecialKeysBar />
       </div>
       {tab === 'macros' && <MacroPanel />}
-      {tab === 'mouse' && <MousePad />}
+      {tab === 'mouse' && (
+        <>
+          <MousePad />
+          <LandmarksPanel />
+        </>
+      )}
       {tab === 'settings' && <SettingsPanel />}
     </div>
   );

@@ -2,9 +2,10 @@
  *
  * Consumes the NUS RX byte stream (any BLE chunking) and emits USB HID
  * keyboard/mouse reports, keystrokes on a US layout, rate-limited to
- * ~15 ms/keystroke. Mouse packets are forwarded without the keystroke
- * rate limit. See PROTOCOL.md for the byte stream contract, including the
- * v2 modifier (0x81/0x82/0x83) and mouse (0x90) escapes.
+ * ~15 ms/keystroke. Mouse and absolute pointer packets are forwarded
+ * without the keystroke rate limit. See PROTOCOL.md for the byte stream
+ * contract, including the v2 modifier (0x81/0x82/0x83), mouse (0x90) and
+ * v4 absolute pointer (0x91) escapes.
  */
 
 #include <zephyr/kernel.h>
@@ -29,16 +30,18 @@ K_SEM_DEFINE(rx_sem, 0, 64);
 /*
  * Escape parser state. 0x00 introduces an escape; the following code byte
  * selects either a special key (single parameter-less byte) or one of the
- * v2 multi-byte sequences (0x81/0x82 take one mask byte, 0x90 takes four
- * parameter bytes). All states survive chunk boundaries: a sequence is
- * only resolved once every byte of it has arrived.
+ * multi-byte sequences (0x81/0x82 take one mask byte, 0x90 takes four
+ * parameter bytes, 0x91 takes five). All states survive chunk boundaries:
+ * a sequence is only resolved once every byte of it has arrived.
  */
 #define ESC_NONE	0	/* not inside an escape sequence */
 #define ESC_CODE	1	/* 0x00 seen, waiting for the escape code byte */
 
-static uint8_t esc_state = ESC_NONE; /* ESC_NONE/ESC_CODE, or pending 0x81/0x82/0x90 */
+static uint8_t esc_state = ESC_NONE; /* ESC_NONE/ESC_CODE, or pending 0x81/0x82/0x90/0x91 */
 static uint8_t mouse_params[4];	/* buttons, dx, dy, wheel for a pending 0x90 */
 static uint8_t mouse_got;
+static uint8_t abs_params[5];	/* buttons, x_lo, x_hi, y_lo, y_hi for a pending 0x91 */
+static uint8_t abs_got;
 static bool busy;
 
 /* Modifier state (v2): bitmask = HID report byte 0. */
@@ -64,6 +67,7 @@ void typing_reset(void)
 	ring_buf_reset(&rx_ring);
 	esc_state = ESC_NONE;
 	mouse_got = 0;
+	abs_got = 0;
 
 	/* A disconnect while modifiers were held must not leave them stuck
 	 * on the host. This runs on the BLE RX thread, where the blocking
@@ -201,7 +205,18 @@ static void handle_mouse_packet(void)
 			 (int8_t)mouse_params[3]);
 }
 
-/* Parameter byte of a pending multi-byte escape (0x81/0x82/0x90). */
+/* 0x91 absolute pointer packet complete: buttons (bit0 left, bit1 right,
+ * bit2 middle) + x/y uint16 LE 0..32767, per PROTOCOL.md v4.
+ */
+static void handle_abs_packet(void)
+{
+	app_led_debug(APP_LED_ABS_RX);
+	usb_abs_report(abs_params[0],
+		       (uint16_t)abs_params[1] | ((uint16_t)abs_params[2] << 8),
+		       (uint16_t)abs_params[3] | ((uint16_t)abs_params[4] << 8));
+}
+
+/* Parameter byte of a pending multi-byte escape (0x81/0x82/0x90/0x91). */
 static void handle_escape_param(uint8_t b)
 {
 	switch (esc_state) {
@@ -221,6 +236,14 @@ static void handle_escape_param(uint8_t b)
 			mouse_got = 0;
 			esc_state = ESC_NONE;
 			handle_mouse_packet();
+		}
+		break;
+	case 0x91: /* absolute pointer packet: buttons, x_lo, x_hi, y_lo, y_hi */
+		abs_params[abs_got++] = b;
+		if (abs_got == sizeof(abs_params)) {
+			abs_got = 0;
+			esc_state = ESC_NONE;
+			handle_abs_packet();
 		}
 		break;
 	default:
@@ -244,6 +267,10 @@ static void handle_escape_code(uint8_t b)
 		return;
 	case 0x90: /* mouse: four parameter bytes follow */
 		mouse_got = 0;
+		esc_state = b;
+		return;
+	case 0x91: /* absolute pointer: five parameter bytes follow */
+		abs_got = 0;
 		esc_state = b;
 		return;
 	default:

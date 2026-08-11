@@ -2,8 +2,9 @@
 
 Zephyr 4.1.0 application for the Nordic PCA10059 dongle (Adafruit UF2
 bootloader). The dongle enumerates as a single composite USB HID device —
-keyboard (report ID 1) + mouse (report ID 2) in one report descriptor — and
-receives keystrokes and mouse packets over BLE NUS per
+keyboard (report ID 1) + mouse (report ID 2) + absolute pointer
+(report ID 3) in one report descriptor — and receives keystrokes, mouse
+packets and absolute pointer packets over BLE NUS per
 [`../PROTOCOL.md`](../PROTOCOL.md).
 
 ## Build
@@ -35,14 +36,17 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
 - **USB**: single HID interface with a composite report descriptor:
   keyboard = input report ID 1 (8-byte report + ID byte, mods + 6-key
   array + LED output report), mouse = input report ID 2 (buttons +
-  X/Y/wheel signed int8 + ID byte). Windows enumerates one USB device
-  exposing both a keyboard and a mouse. Because the descriptor uses report
+  X/Y/wheel signed int8 + ID byte), absolute pointer = input report ID 3
+  (digitizer-class: buttons + X/Y absolute uint16, logical 0..32767 + ID
+  byte). Windows enumerates one USB device exposing all three functions;
+  the absolute pointer maps linearly to the screen with no pointer
+  acceleration. Because the descriptor uses report
   IDs, the interface claims **no boot protocol** (`protocol-code = "none"`)
   — the keyboard does not work in BIOS/UEFI/pre-boot environments.
 - **BLE**: advertises as `VoiceKB` (default; user-settable, see below) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-3.0`.
+  bytes). DIS firmware revision string: `vk-4.0`.
 - **Config characteristic (v3)**: `5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B`
   (read / write-with-response, encrypted link required) on the same service.
   Write a UTF-8 device name (1–20 printable ASCII chars) to rename the
@@ -66,12 +70,18 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
   report (report ID 2); buttons bit0 left / bit1 right / bit2 middle, deltas
   clamped to the descriptor range −127..127. Mouse packets bypass the
   keystroke rate limit.
+- **Absolute pointer (v4)**: `0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo>
+  <y_hi>` emits an absolute pointer report (report ID 3, digitizer-class
+  Touch Screen application collection); buttons as for the mouse, x/y =
+  uint16 LE 0..32767 normalized screen position. Absolute pointer packets
+  bypass the keystroke rate limit.
 - **Status**: TX notifies `0x01` (busy) while the keystroke queue is being
   typed, `0x00` (idle) when drained. Best effort.
 - **LED** (green LED0): slow blink = advertising, solid = connected.
   Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
   report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
-  interface ready, 4 = mouse packet received.
+  interface ready, 4 = mouse packet received, 5 = absolute pointer packet
+  received.
 
 ## Pairing / security
 
@@ -111,9 +121,9 @@ firmware/
 │   └── nrf52840dongle_nrf52840.overlay   # zephyr,hid-device node
 └── src/
     ├── main.c      # init, LED state machine, pairing button (debounced)
-    ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse
+    ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse+abs pointer
     ├── ble.c       # NUS-compatible GATT service, config char (v3), adv, bonding window, gating
-    ├── typing.c    # RX byte stream -> HID reports, US keymap, v2 escapes
+    ├── typing.c    # RX byte stream -> HID reports, US keymap, v2/v4 escapes
     └── vkb.h       # internal interfaces
 ```
 

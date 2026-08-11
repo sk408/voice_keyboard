@@ -121,6 +121,7 @@ Green LED behavior is unchanged (blink = advertising, solid = connected).
 | 2 × 80 ms blinks | **first HID report clocked out by the host** this session (submit is synchronous in this stack: success means the host actually polled the report off the interrupt IN endpoint) |
 | 3 × 120 ms blinks | **HID submit failed** — keystroke attempted while the interface was not ready, or `hid_device_submit_report()` returned an error |
 | 4 × 60 ms blinks | **mouse packet received** (v2 `0x90`) — full packet parsed and forwarded as a report-ID-2 mouse report |
+| 5 × 60 ms blinks | **absolute pointer packet received** (v4 `0x91`) — full packet parsed and forwarded as a report-ID-3 absolute pointer report |
 
 Reading the chain after sending text from the app:
 
@@ -147,9 +148,25 @@ boot by the existing `settings_load()`), applies it to the GAP Device Name
 via `bt_set_name()` (`CONFIG_BT_DEVICE_NAME_DYNAMIC=y`), and rebuilds the
 advertising complete-name field from it on every advertise start — so a name
 set while connected shows up after the next disconnect, and worst case after
-a reboot. DIS firmware revision is `vk-3.0`. The notify-on-`attrs[2]` fix is
-unaffected: the config characteristic is appended after RX, so the TX value
-attribute index does not move.
+a reboot. DIS firmware revision is `vk-4.0` since v4 (was `vk-3.0`). The
+notify-on-`attrs[2]` fix is unaffected: the config characteristic is
+appended after RX, so the TX value attribute index does not move.
+
+## v4: absolute pointer (report ID 3)
+
+v4 appends a third application collection to the composite report
+descriptor (keyboard ID 1 and mouse ID 2 byte-exactly as before, verified
+against the v3 build's compiled descriptor bytes): a digitizer-class Touch
+Screen collection (usage page 0x0D, usage 0x04, Finger logical collection)
+with 3 buttons (usage min/max 1..3, 1 bit each + 5 padding bits) and
+absolute X/Y (Generic Desktop 0x30/0x31, logical 0..32767, 16 bits each) —
+input report ID 3 = 6 bytes including the ID byte. The `0x00 0x91
+<buttons> <x_lo> <x_hi> <y_lo> <y_hi>` escape is parsed with the same
+chunked-escape state machine as `0x90` and forwarded without the keystroke
+rate limit. Descriptor vs send path was verified byte-exactly on the
+compiled image: `hid_report_desc` (173 bytes, symbol extracted from
+`zephyr.elf`) parses to input report lengths 9/5/6 bytes for IDs 1/2/3,
+matching `KB_REPORT_COUNT`/`MS_REPORT_COUNT`/`AB_REPORT_COUNT`.
 
 ## Not verified here
 

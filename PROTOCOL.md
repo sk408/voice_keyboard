@@ -1,4 +1,4 @@
-# Voice Keyboard BLE Protocol v3
+# Voice Keyboard BLE Protocol v4
 
 Contract between the nRF52840 dongle (BLE peripheral, USB HID keyboard toward PC)
 and any central client (web app now; native Android/iOS apps later).
@@ -22,7 +22,7 @@ Standard NUS UUIDs so generic BLE UART libraries/apps work out of the box:
 | RX (central→dongle) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write-no-resp | keystroke payload |
 | TX (dongle→central) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | status bytes |
 
-Also standard DIS (0x180A) with Firmware Revision String = `vk-3.0`.
+Also standard DIS (0x180A) with Firmware Revision String = `vk-4.0`.
 
 ## GATT — config characteristic (v3)
 
@@ -55,9 +55,22 @@ Stream of bytes, any chunking; dongle types as received, rate-limited (~15 ms/ke
   - `0x01` Esc, `0x02` Up, `0x03` Down, `0x04` Left, `0x05` Right,
     `0x06` Delete, `0x07` Home, `0x08` End, `0x09` PageUp, `0x0A` PageDown,
     `0x10`–`0x1B` F1–F12
-## RX payload — v2 extensions
+## RX payload — v5 extensions (dongle-stored macros)
 
-- **Modifiers** (0x80 range):
+The dongle is the source of truth for user macros (flash-persisted, like bonds/name).
+Any client connects and reads the same library.
+
+- **Macro store characteristics** on the custom service (UUIDs registered in v5 firmware README):
+  - MACRO_LIST (read, notify): JSON array `[{"i":0,"name":"SOAP note","len":412}, ...]`
+  - MACRO_RW (write-with-response + read): chunked transfer —
+    - Write: `{"op":"put","i":0,"name":"...","off":0,"data":"<utf8 chunk>"}`; chunks ≤180 B,
+      `off` cumulative; final chunk has `"fin":true`. `{"op":"del","i":2}` deletes.
+    - Read: `{"op":"get","i":0,"off":0}` → response/notify returns the same chunk shape.
+  - Capacity: 16 macros, 16 KB total flash budget (documented; firmware rejects with error notify `0xE1` full).
+- **Standalone trigger** (optional v5 feature): long-press (>1.5 s) the dongle button with no BLE
+  connection plays macro index 0 over USB. Short press remains the pairing window.
+
+## RX payload — v2 extensions (modifiers + relative mouse)
   - `0x00 0x81 <bitmask>` = sticky-arm modifiers for the NEXT key only (then auto-release)
   - `0x00 0x82 <bitmask>` = hold modifiers down until release
   - `0x00 0x83` = release all modifiers
@@ -66,6 +79,10 @@ Stream of bytes, any chunking; dongle types as received, rate-limited (~15 ms/ke
 - **Mouse** (requires the composite HID descriptor; keyboard = report ID 1, mouse = report ID 2):
   - `0x00 0x90 <buttons> <dx> <dy> <wheel>` — buttons bit0 left/bit1 right/bit2 middle;
     dx, dy, wheel = signed int8 relative movement. Sent at touch-event rate; firmware clamps per-report deltas to int8 range.
+- **Absolute pointer** (report ID 3, digitizer-class; Windows maps logical extent linearly to the screen — no pointer acceleration):
+  - `0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo> <y_hi>` — buttons as above; x, y = uint16 LE, 0..32767 normalized screen position.
+  - Intended use: teleport/landmark clicks, drag-select with exact endpoints, tablet-style tracking.
+    Calibration: verify-first (teleport to corners, user confirms); four-corner learn mode is the fallback for odd monitor mappings.
 
 ## TX notifications (status)
 

@@ -101,6 +101,28 @@ function clampAxis(v: number): number {
   return Math.max(-127, Math.min(127, Math.round(v)));
 }
 
+/* --- v4: absolute pointer (PROTOCOL.md "v2 extensions", report ID 3) --- */
+
+/** Normalized absolute coordinates are uint16, 0..32767. */
+function clampNorm(v: number): number {
+  return Math.max(0, Math.min(32767, Math.round(v)));
+}
+
+/** One absolute pointer report: `0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo> <y_hi>` (v4). */
+export function encodeAbsolute(buttons: number, x: number, y: number): Uint8Array {
+  const nx = clampNorm(x);
+  const ny = clampNorm(y);
+  return new Uint8Array([
+    ESCAPE,
+    0x91,
+    buttons & 0xff,
+    nx & 0xff,
+    (nx >> 8) & 0xff,
+    ny & 0xff,
+    (ny >> 8) & 0xff,
+  ]);
+}
+
 /** One relative mouse report: `0x00 0x90 <buttons> <dx> <dy> <wheel>`. */
 export function encodeMouse(buttons: number, dx: number, dy: number, wheel: number): Uint8Array {
   return new Uint8Array([
@@ -181,6 +203,7 @@ function escapeSeqLen(code: number): number {
   if (code === 0x81 || code === 0x82) return 3; // sticky-arm / hold + mask byte
   if (code === 0x83) return 2; // release all
   if (code === 0x90) return 6; // mouse: buttons, dx, dy, wheel
+  if (code === 0x91) return 7; // absolute pointer: buttons, x (LE), y (LE)
   if (isSpecialCode(code)) return 2; // special keys
   return 0;
 }
@@ -195,10 +218,10 @@ function escapeSeqLen(code: number): number {
  * only fall inside a multi-byte sequence if the payload exceeds the chunk
  * size mid-character; scanning for UTF-8 continuation bytes keeps each
  * write decodable on its own). Chunks also never split a `0x00` escape
- * sequence (special key, modifier, or mouse packet).
+ * sequence (special key, modifier, mouse, or absolute pointer packet).
  */
 export function chunkPayload(data: Uint8Array, chunkSize = 20): Uint8Array[] {
-  if (chunkSize < 6) throw new Error('chunkSize too small for escape-sequence safety');
+  if (chunkSize < 7) throw new Error('chunkSize too small for escape-sequence safety');
 
   // Positions where a cut would land inside an escape sequence.
   const noCut = new Uint8Array(data.length);

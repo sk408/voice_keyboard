@@ -82,12 +82,63 @@ the status line below the bar:
 
 ### Mouse tab
 
-The **Mouse** tab is a full-width trackpad: one-finger drag moves the
-pointer (0x90 packets, throttled to ~50/s), tap = left click, two-finger
-tap = right click, two-finger drag = scroll wheel. Left/middle/right are
-also available as hold-to-press on-screen buttons (hold Left while dragging
-on the trackpad for drag-select). Switching tabs is pure view state — the
-BLE connection is owned by the store and is never torn down.
+The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v4 gesture
+model:
+
+- **One finger** uses the configured one-finger mode (Settings → One-finger
+  trackpad mode):
+  - **Absolute pointer** (default): the pad maps to the whole screen through
+    the calibration map — the cursor tracks your finger like a tablet, and
+    lifting + re-touching jumps the cursor (no deltas). Sent as `0x91`
+    absolute packets (HID report ID 3, digitizer class). Windows maps the
+    absolute digitizer's logical extent **linearly** to the screen — no
+    pointer acceleration applies.
+  - **Classic relative**: ordinary touchpad deltas (`0x90` packets).
+- **Two fingers** always give classic relative deltas, in either mode.
+- **Tap** = left click, **two-finger tap** = right click. In absolute mode a
+  tap clicks at the tapped spot (press + release `0x91` at that position).
+- **Scroll strip** (right edge): vertical drag = scroll wheel, natural
+  direction (drag up = scroll up).
+- **Left / Middle / Right** on-screen buttons are hold-to-press; the held set
+  rides in every packet (both `0x90` and `0x91`), so hold Left while dragging
+  for drag-select in either mode.
+
+All pointer packets are throttled to ~50/s. Switching tabs is pure view
+state — the BLE connection is owned by the store and is never torn down.
+
+### Pointer calibration (Settings)
+
+Absolute mode needs to know how the host maps the 0..32767 normalized extent
+onto the actual screen. The **Calibrate pointer** wizard (Settings → Pointer
+calibration) is verify-first:
+
+1. The cursor is teleported to the top-left corner through the current map;
+   confirm it, then the same for bottom-right. Both confirmed → the current
+   map is kept, done.
+2. Any "No" starts **four-corner learn mode**: for each corner (top-left,
+   top-right, bottom-left, bottom-right) drag on the wizard's pad until the
+   host cursor sits exactly at that corner, then tap **Set corner**. After
+   all four, a new map is derived and saved.
+
+The map is persisted per device (keyed by the dongle's name) and reloaded on
+connect. Requires firmware **vk-4.0** (absolute pointer, HID report ID 3).
+
+### Landmarks (Mouse tab)
+
+Below the mouse buttons: **Save current spot** stores the last-sent absolute
+cursor position under a name (enabled once you've moved the pointer at least
+once). Each landmark has **Go** (teleport), **Go + click** (teleport and
+left-click at the spot), and **Delete**. Landmarks are stored per device and
+can be used from macros:
+
+- `{click 80% 90%}` — click at 80 % / 90 % of the screen (through the
+  calibration map).
+- `{click "Save button"}` — click at the named landmark. An unknown landmark
+  stops the macro run with a warning instead of being silently skipped.
+
+Absolute-pointer features (absolute trackpad mode, calibration, landmarks,
+macro clicks) require dongle firmware **vk-4.0** or later (PROTOCOL.md: `0x91`
+packets, composite HID report ID 3).
 
 ## Install as a PWA (Android)
 
@@ -110,8 +161,10 @@ Deployment is via GitHub Actions → GitHub Pages (see
 
 ## Layout
 
-- `src/protocol.ts` — pure protocol encoding (chunking, escaping, edit diffs, v2 modifier/mouse packets); unit-tested.
+- `src/protocol.ts` — pure protocol encoding (chunking, escaping, edit diffs, v2 modifier/mouse packets, v4 absolute pointer); unit-tested.
 - `src/ble.ts` — Web Bluetooth / NUS connection, write queue, error classification; queue unit-tested (`ble.test.ts`).
-- `src/store.ts` — zustand app state (connection, mode, status, modifier state, errors).
-- `src/components/` — status bar, mode toggle, live/compose inputs, sticky modifier bar, special keys bar, mouse trackpad.
+- `src/calibration.ts` — screen-fraction ↔ normalized mapping, four-corner calibration, per-device persistence; unit-tested.
+- `src/landmarks.ts` — named absolute cursor spots, per-device persistence; unit-tested.
+- `src/store.ts` — zustand app state (connection, mode, status, modifier state, pointer mode, calibration, landmarks, errors).
+- `src/components/` — status bar, mode toggle, live/compose inputs, sticky modifier bar, special keys bar, mouse trackpad + scroll strip, landmarks, calibration wizard.
 - `public/` — manifest, service worker, icons (`scripts/gen_icons.py` regenerates them).

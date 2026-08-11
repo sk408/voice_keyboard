@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { encodeSegment, macroFields, tokenizeMacro } from '../macros';
+import { encodeSegment, macroFields, tokenizeMacro, type ClickContext } from '../macros';
+import { findLandmark } from '../landmarks';
 import type { Macro } from '../macroStorage';
 import { useAppStore } from '../store';
 
@@ -45,6 +46,13 @@ export default function MacroRunner({ macro, onExit }: Props) {
     let fieldDone = 0;
     setProgress({ done: 0, total: fieldTotal });
 
+    // Click segments resolve through the store: the current calibration map
+    // for {click x% y%} targets, per-device landmarks for {click "name"}.
+    const ctx: ClickContext = {
+      map: useAppStore.getState().calibration,
+      landmark: (name) => findLandmark(useAppStore.getState().deviceKey(), name),
+    };
+
     const stopWith = (msg: string) => {
       if (!mountedRef.current) return;
       setMessage(msg);
@@ -60,7 +68,18 @@ export default function MacroRunner({ macro, onExit }: Props) {
         stopWith('Stopped — dongle disconnected');
         return;
       }
-      const ok = await sendSegment(encodeSegment(segment, vals));
+      const payload = encodeSegment(segment, vals, ctx);
+      if (segment.type === 'click' && payload.length === 0) {
+        // A click target that encodes to nothing (e.g. unknown landmark)
+        // must be loud, not silently skipped.
+        stopWith(
+          segment.target.kind === 'landmark'
+            ? `Stopped — unknown landmark "${segment.target.name}". Save it on the Mouse tab first.`
+            : 'Stopped — click target could not be resolved.',
+        );
+        return;
+      }
+      const ok = await sendSegment(payload);
       if (!mountedRef.current) return;
       if (segment.type === 'field') {
         fieldDone++;

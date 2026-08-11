@@ -18,6 +18,7 @@ enum app_led_code {
 	APP_LED_HID_FAIL,	/* 3 blinks: HID report submit failed/not ready */
 	APP_LED_HID_READY,	/* solid 1 s: host configured the HID interface */
 	APP_LED_MOUSE_RX,	/* 4 short blinks: mouse packet received */
+	APP_LED_ABS_RX,		/* 5 short blinks: absolute pointer packet received */
 };
 
 void app_led_debug(enum app_led_code code);
@@ -29,6 +30,8 @@ bool usb_kbd_ready(void);
 int usb_kbd_report(uint8_t mods, uint8_t key);
 /* Submit one mouse report (report ID 2). Deltas are clamped to [-127, 127]. */
 int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel);
+/* Submit one absolute pointer report (report ID 3). x/y: 0..32767. */
+int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y);
 
 /* --- BLE NUS peripheral (ble.c) --- */
 int ble_init(void);
