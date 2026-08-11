@@ -508,6 +508,72 @@ button.secondary {
   line-height: 1.5;
 }
 
+/* v5: dongle-store badges, storage meter, banners */
+.macro-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.macro-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+
+.macro-badge-dongle {
+  background: var(--accent);
+  color: #fff;
+}
+
+.macro-badge-button {
+  background: gold;
+  color: #000;
+}
+
+.macro-badge-draft {
+  border: 1px dashed var(--muted);
+  color: var(--muted);
+}
+
+.macro-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.macro-meter-track {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.macro-meter-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.macro-meter-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.macro-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--panel);
+  border-left: 4px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 0.95rem;
+}
+
 .macro-runner {
   display: flex;
   flex-direction: column;

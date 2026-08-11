@@ -17,3 +17,25 @@
 		in-polling-period-us = <1000>;
 	};
 };
+
+/* v5: the stock 16 KB storage partition (4 NVS sectors) cannot hold the
+ * 16 KB macro store alongside bonds and the device name (NVS needs a free
+ * sector for GC). Move storage into the tail of the unused slot1 (image-1)
+ * partition and enlarge it to 32 KB (8 sectors). The app is capped below
+ * 0xB4000 via CONFIG_FLASH_LOAD_SIZE. Side effect: bonds/name stored by
+ * firmware <= v4 live in the old partition and are not migrated — re-pair
+ * and re-set the name once after flashing v5.
+ */
+&flash0 {
+	partitions {
+		/delete-node/ partition@dc000;
+		storage_partition: partition@b4000 {
+			label = "storage";
+			reg = <0x000b4000 0x00008000>;
+		};
+	};
+};
+
+&slot1_partition {
+	reg = <0x00076000 0x0003e000>;
+};

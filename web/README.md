@@ -80,6 +80,31 @@ the status line below the bar:
   `0x00 0x83` release-all when the last one is released). **Clear**
   releases everything.
 
+### Macros tab
+
+Macros are named text templates with tokens (`{enter}`, `{ctrl+x}`, …),
+fill-in fields (`{{name}}`) and clicks (`{click 50% 25%}`,
+`{click "Save button"}`). **Run** types a macro through the dongle; Export /
+Import move the library between phones as JSON.
+
+With dongle firmware **vk-5.0** or later the dongle is the source of truth:
+macros are stored in its flash (16 slots, 16 KB total) and sync to whatever
+phone connects. On connect the app reads the dongle's list and merges it
+into the manager; localStorage is only a read-through cache. Details:
+
+- Badges on each row: **On dongle** (with the slot), **This phone** (local
+  draft), **★ Button macro** (slot 0).
+- A storage meter shows dongle usage (used / 16 KB).
+- **Migration**: if the dongle's store is empty but this phone has macros
+  (v3/v4 users), a banner offers a one-tap **Copy to dongle**.
+- **Offline**: with no dongle connected, edits and deletes queue as local
+  drafts (deletions are remembered as tombstones) and sync on the next
+  connect. Macros that don't fit stay on the phone, with a notice.
+- **Button macro**: the macro in slot 0 plays standalone — long-press
+  (>1.5 s) the dongle button with no BLE connection and the dongle types it
+  over USB on its own. Use the **★ Button** action on a macro to put it in
+  slot 0. A short button press is still the pairing window.
+
 ### Mouse tab
 
 The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v4 gesture

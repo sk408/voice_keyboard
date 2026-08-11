@@ -20,6 +20,9 @@ in this tree. Ordered by likelihood of causing the reported symptom.
 - (v3) `attrs[7]` config characteristic **value** — the TX **value** is still
   `attrs[2]`; the config characteristic is appended after RX, so the fix
   below is unaffected
+- (v5) `attrs[8]` MACRO_LIST declaration, `attrs[9]` MACRO_LIST **value**
+  (notify target), `attrs[10]` MACRO_LIST CCC, `attrs[11]` MACRO_RW
+  declaration, `attrs[12]` MACRO_RW value
 
 `BT_GATT_CHARACTERISTIC` expands to *two* attributes (declaration + value), so
 `attrs[1]` is the declaration, not the value. Notifications went out with the
@@ -97,8 +100,8 @@ thread. Now `atomic_t`.
   `msg_cb` calls `usbd_enable()` on `USBD_MSG_VBUS_READY` — same pattern as
   the working hid-keyboard sample. Since BLE runs, `main()` provably got past
   `usbd_init()` without error.
-- **Flash layout: OK.** `storage` partition at `0xDC000`/16 KB intact, app
-  links at `0x26000`; bonds persist across reboot.
+- **Flash layout: OK.** `storage` partition intact (moved to `0xB4000`/32 KB
+  in v5, see below); app links at `0x26000`; bonds persist across reboot.
 
 ## Likely full story
 
@@ -122,6 +125,7 @@ Green LED behavior is unchanged (blink = advertising, solid = connected).
 | 3 × 120 ms blinks | **HID submit failed** — keystroke attempted while the interface was not ready, or `hid_device_submit_report()` returned an error |
 | 4 × 60 ms blinks | **mouse packet received** (v2 `0x90`) — full packet parsed and forwarded as a report-ID-2 mouse report |
 | 5 × 60 ms blinks | **absolute pointer packet received** (v4 `0x91`) — full packet parsed and forwarded as a report-ID-3 absolute pointer report |
+| 6 × 60 ms blinks | **macro playback started** (v5) — a stored macro (standalone button trigger) began feeding the typing engine |
 
 Reading the chain after sending text from the app:
 
@@ -167,6 +171,37 @@ rate limit. Descriptor vs send path was verified byte-exactly on the
 compiled image: `hid_report_desc` (173 bytes, symbol extracted from
 `zephyr.elf`) parses to input report lengths 9/5/6 bytes for IDs 1/2/3,
 matching `KB_REPORT_COUNT`/`MS_REPORT_COUNT`/`AB_REPORT_COUNT`.
+
+## v5: dongle-stored macros + standalone trigger
+
+v5 appends MACRO_LIST (`5A1B0002-…`, read + notify) and MACRO_RW
+(`5A1B0003-…`, write-with-response + read) to the same service, both
+encrypted-link only (see PROTOCOL.md for the wire format). The store
+(`macro.c`) keeps 16 slots under a 16 KB budget, mirrored in RAM and
+persisted via settings/NVS as `vkbm/<i>/n` + `vkbm/<i>/t/<k>` — templates
+are chunked at 2 KB because one NVS record must fit a 4 KB flash sector.
+Chunk keys are reassembled and validated at boot (`macro_boot_finalize()`,
+called right after `settings_load()` in `ble_init`); a partial set drops
+the slot rather than playing back a corrupt template.
+
+Two layout changes came with it:
+
+- **Storage partition moved**: the stock 16 KB at `0xDC000` (4 NVS sectors)
+  cannot hold a 16 KB macro store alongside bonds/name (NVS needs a free
+  sector for GC). The overlay moves `storage` to `0xB4000`/32 KB (8
+  sectors), carved out of the unused slot1 partition, and
+  `CONFIG_FLASH_LOAD_SIZE` shrank to `0x8E000` so the app can never grow
+  into it (current image ends near `0x5D000`). Bonds/name from ≤v4 are not
+  migrated — re-pair once after flashing.
+- **Button interrupts now fire on both edges** (`GPIO_INT_EDGE_BOTH`): the
+  debounced handler times press→release; ≥1.5 s with no BLE connection
+  plays macro slot 0 through the normal typing ring (`typing_play()`, same
+  path as NUS RX bytes), a short press opens the pairing window as before.
+
+The minimal JSON walker in `macro.c` parses the fixed client shape only and
+unescapes `data` at the byte level (printable ASCII, `\"`/`\\`, `\u00XX`
+per raw byte), so chunk boundaries may split UTF-8 characters and escape
+sequences freely. DIS firmware revision is `vk-5.0`.
 
 ## Not verified here
 

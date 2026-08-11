@@ -31,6 +31,13 @@ Output: `~/voice_keyboard/firmware/build/zephyr/zephyr.uf2`.
 The app is linked at `0x26000` (Adafruit bootloader layout: MBR + SoftDevice
 below, bootloader at `0xF4000`) and does not touch the bootloader.
 
+**v5 flash-layout change**: the settings storage partition moved from the
+stock 16 KB at `0xDC000` to 32 KB at `0xB4000` (tail of the unused slot1
+partition; the app is capped below it via `CONFIG_FLASH_LOAD_SIZE`) to make
+room for the macro store next to bonds and the device name. Side effect of
+flashing v5 over ≤v4: bonds and the custom name stored in the old partition
+are not migrated — re-pair and re-set the name once.
+
 ## Behavior
 
 - **USB**: single HID interface with a composite report descriptor:
@@ -46,7 +53,7 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
 - **BLE**: advertises as `VoiceKB` (default; user-settable, see below) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-4.0`.
+  bytes). DIS firmware revision string: `vk-5.0`.
 - **Config characteristic (v3)**: `5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B`
   (read / write-with-response, encrypted link required) on the same service.
   Write a UTF-8 device name (1–20 printable ASCII chars) to rename the
@@ -54,6 +61,54 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
   Device Name immediately and to the advertising data on the next advertise
   (after disconnect). Read returns the current name. Invalid names are
   rejected (`Value Not Allowed`).
+- **Macro store characteristics (v5)**: two more vendor characteristics on
+  the same service, same vendor UUID base, both encrypted-link only:
+  - MACRO_LIST `5A1B0002-8C4D-4E2F-9A3B-7C6D5E4F3A2B` (read + notify):
+    JSON array of the stored macros, e.g.
+    `[{"i":0,"name":"SOAP note","len":412}]` (`[]` when empty). A notify is
+    sent whenever the store changes (put/del completes). Best effort: if the
+    list outgrows the negotiated ATT MTU the notification is dropped — the
+    full value can always be read from the characteristic.
+  - MACRO_RW `5A1B0003-8C4D-4E2F-9A3B-7C6D5E4F3A2B` (write-with-response +
+    read), chunked transfer:
+    - Write `{"op":"put","i":0,"name":"...","off":0,"data":"..."}` — each
+      ATT write carries ≤180 bytes of payload; `off` is the cumulative byte
+      offset into the template; the final chunk adds `"fin":true`. `name`
+      is only required on the first chunk (`off`=0). A new `off`=0 chunk
+      restarts an interrupted put; a disconnect aborts it (staging
+      discarded).
+    - Write `{"op":"del","i":2}` deletes slot 2 (deleting an empty slot is
+      a no-op).
+    - Write `{"op":"get","i":0,"off":412}` prepares a read chunk; reading
+      MACRO_RW then returns
+      `{"op":"get","i":0,"off":412,"len":TOTAL,"data":"..."}` plus
+      `"fin":true` when the chunk reaches the end. Responses are capped at
+      180 bytes (a read with no preceding get returns `{}`).
+  - JSON `data` encoding (client contract): the template is an arbitrary
+    byte stream (UTF-8 text + pre-encoded `0x00` escape tokens). Printable
+    safe ASCII passes through; every other byte — control bytes incl. the
+    `0x00` escape marker, and bytes ≥0x80 — is encoded as one `\u00XX`
+    escape per raw byte (uppercase hex), plus the standard JSON escapes
+    `\"` and `\\`. The result is strict JSON in both directions (the
+    firmware's get responses use the same encoding). Chunk boundaries may
+    fall anywhere in the byte stream (mid-UTF-8 character,
+    mid-escape-sequence): the firmware unescapes each chunk at the byte
+    level and appends the raw bytes, never interpreting UTF-8.
+  - Capacity: 16 slots (indices 0–15), name ≤24 bytes each, 16 KB total
+    store budget. A put that would exceed the budget is rejected: the write
+    fails with an ATT error and error notify `0xE1` is sent on the NUS TX
+    characteristic. An empty template (`fin` with no data) deletes the slot.
+  - Persistence: settings/NVS under `vkbm/<i>/n` (name) and
+    `vkbm/<i>/t/<k>` (template chunks of 2 KB — one NVS record must fit a
+    4 KB flash sector). Chunks are validated and reassembled at boot;
+    a partial/corrupt set (e.g. power loss mid-commit) drops the slot.
+- **Macro playback (v5)**: playing a stored macro feeds its template bytes
+  through the same typing-engine path as NUS RX bytes — tokens/escapes are
+  stored pre-encoded by the client, the dongle just types the byte stream.
+  **Standalone trigger**: a long press (>1.5 s) of the dongle button while
+  no BLE connection is active plays macro slot 0 over USB. Short press
+  remains the 60 s pairing window (unchanged, also while connected). If
+  slot 0 is empty, a long press does nothing.
 - **Typing**: RX bytes are reassembled as a byte stream (robust to any BLE
   chunking, including escape sequences split across chunk boundaries) and
   typed on a US layout at ~15 ms/keystroke. Shift handling for

@@ -70,6 +70,9 @@ void app_led_debug(enum app_led_code code)
 	case APP_LED_ABS_RX:
 		dbg_on_ms = 60; dbg_off_ms = 60; dbg_pulses = 5;
 		break;
+	case APP_LED_MACRO_PLAY:
+		dbg_on_ms = 60; dbg_off_ms = 60; dbg_pulses = 6;
+		break;
 	default:
 		return;
 	}
@@ -79,8 +82,15 @@ void app_led_debug(enum app_led_code code)
 	}
 }
 
-/* Onboard button (sw0): opens the 60 s pairing window. */
+/* Onboard button (sw0): short press opens the 60 s pairing window; long
+ * press (>1.5 s) with no BLE connection plays macro slot 0 over USB (v5).
+ */
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+
+#define LONG_PRESS_MS	1500
+
+static int64_t press_start;
+static bool press_valid;
 
 enum led_state {
 	LED_OFF,
@@ -127,11 +137,35 @@ static void button_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	/* Debounced: sample the pin after the delay. */
+	/* Debounced: sample the pin after the delay. Interrupts fire on both
+	 * edges, so this runs once per settled press and once per release.
+	 */
 	if (gpio_pin_get_dt(&button) == 1) {
-		LOG_INF("Button pressed");
-		ble_open_pairing_window();
+		press_start = k_uptime_get();
+		press_valid = true;
+		return;
 	}
+
+	if (!press_valid) {
+		return;
+	}
+	press_valid = false;
+
+	if (k_uptime_get() - press_start >= LONG_PRESS_MS) {
+		/* Long press: standalone macro trigger, only while no central
+		 * is connected (macro_play is a no-op when slot 0 is empty).
+		 */
+		if (!ble_is_connected()) {
+			LOG_INF("Long press: playing macro 0");
+			macro_play(0);
+		} else {
+			LOG_INF("Long press ignored (BLE connected)");
+		}
+		return;
+	}
+
+	LOG_INF("Button pressed");
+	ble_open_pairing_window();
 }
 
 static K_WORK_DELAYABLE_DEFINE(button_work, button_work_handler);
@@ -160,7 +194,7 @@ static int button_init(void)
 		return ret;
 	}
 
-	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
 	if (ret) {
 		return ret;
 	}

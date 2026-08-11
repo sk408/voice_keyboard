@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DongleConnection } from './ble';
-import { NUS_RX_UUID } from './protocol';
+import { CONFIG_CHAR_UUID, NUS_RX_UUID } from './protocol';
+import { MACRO_LIST_UUID, MACRO_RW_UUID } from './macroSync';
 
 /**
  * Queue behavior tests with a fully mocked Web Bluetooth device.
@@ -135,5 +136,158 @@ describe('connect / disconnect', () => {
     const { conn, raw } = await connectFake();
     fireDisconnect(raw);
     await expect(conn.send(new Uint8Array([0x61]))).rejects.toThrow('not connected');
+  });
+});
+
+/* --- v5 macro store characteristics --- */
+
+interface FakeV5Options {
+  /** Simulate pre-v5 firmware: the macro characteristics are absent. */
+  omitMacroStore?: boolean;
+  macroListJson?: string;
+}
+
+function makeFakeV5Device(opts: FakeV5Options = {}) {
+  const rx = {
+    properties: { write: true, writeWithoutResponse: true },
+    writeValueWithoutResponse: vi.fn(async (_v: Uint8Array) => {}),
+    writeValueWithResponse: vi.fn(async (_v: Uint8Array) => {}),
+  };
+  const tx = {
+    startNotifications: vi.fn(async () => {}),
+    addEventListener: vi.fn(),
+  };
+  const config = {
+    readValue: vi.fn(async () => new DataView(new TextEncoder().encode('VoiceKB').buffer)),
+    writeValueWithResponse: vi.fn(async (_v: Uint8Array) => {}),
+  };
+  const macroList = {
+    readValue: vi.fn(
+      async () => new DataView(new TextEncoder().encode(opts.macroListJson ?? '[]').buffer),
+    ),
+    startNotifications: vi.fn(async () => {}),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  };
+  const reads: string[] = [];
+  const macroRw = {
+    written: [] as Uint8Array[],
+    writeValueWithResponse: vi.fn(async (v: Uint8Array) => {
+      macroRw.written.push(v);
+    }),
+    readValue: vi.fn(async () => {
+      const next = reads.shift();
+      if (next === undefined) throw new Error('no queued read');
+      return new DataView(new TextEncoder().encode(next).buffer);
+    }),
+  };
+  const queueRead = (json: string) => reads.push(json);
+
+  const service = {
+    getCharacteristic: vi.fn(async (uuid: string) => {
+      if (uuid === NUS_RX_UUID) return rx;
+      if (uuid === MACRO_LIST_UUID || uuid === MACRO_RW_UUID) {
+        if (opts.omitMacroStore) throw new DOMException('Not found', 'NotFoundError');
+        return uuid === MACRO_LIST_UUID ? macroList : macroRw;
+      }
+      return uuid === CONFIG_CHAR_UUID ? config : tx;
+    }),
+  };
+  const gatt = {
+    connected: true,
+    connect: vi.fn(async () => ({ getPrimaryService: vi.fn(async () => service) })),
+    disconnect: vi.fn(() => {
+      gatt.connected = false;
+    }),
+  };
+  const raw = {
+    id: 'fake-dongle-v5',
+    name: 'VoiceKB',
+    gatt,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  };
+  return {
+    device: raw as unknown as BluetoothDevice,
+    raw,
+    rx,
+    tx,
+    macroList,
+    macroRw,
+    queueRead,
+    gatt,
+  };
+}
+
+async function connectFakeV5(opts: FakeV5Options = {}) {
+  const fake = makeFakeV5Device(opts);
+  const conn = await DongleConnection.connect(fake.device, vi.fn(), vi.fn());
+  return { conn, ...fake };
+}
+
+describe('v5 macro store characteristics', () => {
+  it('connects cleanly when the characteristics are absent (pre-v5 firmware)', async () => {
+    const { conn } = await connectFakeV5({ omitMacroStore: true });
+    expect(conn.supportsMacroStore).toBe(false);
+    expect(await conn.readMacroList()).toBeNull();
+  });
+
+  it('detects the v5 store and reads MACRO_LIST', async () => {
+    const { conn } = await connectFakeV5({ macroListJson: '[{"i":0,"name":"A","len":4}]' });
+    expect(conn.supportsMacroStore).toBe(true);
+    expect(await conn.readMacroList()).toBe('[{"i":0,"name":"A","len":4}]');
+  });
+
+  it('subscribes to MACRO_LIST notifications', async () => {
+    const { conn, macroList } = await connectFakeV5();
+    const listener = vi.fn();
+    await conn.subscribeMacroList(listener);
+    expect(macroList.startNotifications).toHaveBeenCalledTimes(1);
+    const handler = macroList.addEventListener.mock.calls.find(
+      ([type]) => type === 'characteristicvaluechanged',
+    )?.[1] as (event: Event) => void;
+    expect(handler).toBeDefined();
+    handler(new Event('characteristicvaluechanged'));
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes macro writes and reads through the macro queue', async () => {
+    const { conn, macroRw, queueRead } = await connectFakeV5();
+    queueRead('{"op":"get","i":0,"off":0,"len":1,"data":"a","fin":true}');
+    await conn.macroStoreWrite(new TextEncoder().encode('{"op":"get","i":0,"off":0}'));
+    expect(await conn.macroStoreRead()).toContain('"op":"get"');
+    expect(macroRw.written).toHaveLength(1);
+    await expect(conn.macroStoreRead()).rejects.toThrow('no queued read');
+    // The queue survives the failed read.
+    await conn.macroStoreWrite(new TextEncoder().encode('{"op":"del","i":1}'));
+    expect(macroRw.written).toHaveLength(2);
+  });
+
+  it('performs a get round-trip atomically — no write slips between request and read', async () => {
+    const { conn, macroRw } = await connectFakeV5();
+    const events: string[] = [];
+    const responses = ['{"op":"get","i":0,"off":0,"len":1,"data":"a","fin":true}'];
+    macroRw.writeValueWithResponse.mockImplementation(async (v: Uint8Array) => {
+      macroRw.written.push(v);
+      events.push(`write:${new TextDecoder().decode(v)}`);
+    });
+    macroRw.readValue.mockImplementation(async () => {
+      events.push('read');
+      return new DataView(new TextEncoder().encode(responses.shift() ?? '{}').buffer);
+    });
+    const getReq = new TextEncoder().encode('{"op":"get","i":0,"off":0}');
+    const del = new TextEncoder().encode('{"op":"del","i":1}');
+    // Enqueue the round-trip and a competing write back-to-back: the del
+    // write must wait until the get's read has happened.
+    const [response] = await Promise.all([
+      conn.macroStoreGetRoundtrip(getReq),
+      conn.macroStoreWrite(del),
+    ]);
+    expect(response).toContain('"op":"get"');
+    expect(events).toEqual([
+      'write:{"op":"get","i":0,"off":0}',
+      'read',
+      'write:{"op":"del","i":1}',
+    ]);
   });
 });

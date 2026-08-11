@@ -26,6 +26,29 @@ import {
   saveLandmark,
   type Landmark,
 } from './landmarks';
+import {
+  addTombstone,
+  loadMacros,
+  loadTombstones,
+  newMacroId,
+  saveMacros,
+  saveTombstones,
+  type Macro,
+} from './macroStorage';
+import {
+  bytesToTemplate,
+  compiledLength,
+  encodeDelete,
+  fetchMacroBytes,
+  macroFootprint,
+  parseMacroList,
+  planCopy,
+  pushMacro,
+  storageUsed,
+  type MacroListEntry,
+  type MacroStoreIO,
+} from './macroSync';
+import { encodeMacro } from './macros';
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 export type TypingMode = 'live' | 'compose';
@@ -102,6 +125,23 @@ interface AppState {
   /** Landmarks for the current device. */
   landmarks: Landmark[];
 
+  /**
+   * Macro list shown in the manager. With a v5 dongle connected this mirrors
+   * the dongle store (source of truth) plus local drafts; offline it is the
+   * localStorage cache. A macro with `slot` set lives on the dongle.
+   */
+  macros: Macro[];
+  /** True when the connected dongle exposes the v5 macro store. */
+  macroStoreSupported: boolean;
+  /** A sync with the dongle macro store is in flight. */
+  macroSyncing: boolean;
+  /** Dongle store usage in bytes, from the last MACRO_LIST snapshot. */
+  macroStorageUsed: number;
+  /** Dongle store is empty but this phone has macros → offer one-tap copy. */
+  migrationAvailable: boolean;
+  /** Transient result/notice line for macro sync operations. */
+  macroNotice: string | null;
+
   setMode(mode: TypingMode): void;
   refreshGrantedDevices(): Promise<void>;
   connectViaChooser(): Promise<void>;
@@ -141,12 +181,31 @@ interface AppState {
    * into the store error state either way).
    */
   sendSegment(payload: Uint8Array): Promise<boolean>;
+  /** Macro manager: create (`editing` null) or update a macro; syncs to the dongle when possible. */
+  saveMacroEdit(editing: Macro | null, name: string, template: string): void;
+  /** Macro manager: delete a macro (locally and, when possible, on the dongle). */
+  deleteMacro(macro: Macro): void;
+  /** Macro manager: duplicate a macro as a local draft. */
+  duplicateMacro(macro: Macro): void;
+  /** Macro manager: append imported macros as local drafts. */
+  importMacros(items: { name: string; template: string }[]): void;
+  /** Migration banner: copy local macros to an empty dongle store. */
+  copyMacrosToDongle(): Promise<void>;
+  /** Choose the standalone "button macro" (dongle slot 0, long-press trigger). Online only. */
+  makeButtonMacro(macro: Macro): void;
+  dismissMacroNotice(): void;
   clearError(): void;
 }
 
 let dongle: DongleConnection | null = null;
 /** Sends currently in flight; drives the optimistic "typing…" badge. */
 let pendingSends = 0;
+/**
+ * Guards so a MACRO_LIST notification firing mid-sync (the dongle notifies
+ * on every store change, including our own writes) cannot overlap syncs.
+ */
+let macroSyncInProgress = false;
+let macroResyncNeeded = false;
 
 export const useAppStore = create<AppState>((set, get) => {
   function handleSendError(e: unknown): void {
@@ -203,6 +262,214 @@ export const useAppStore = create<AppState>((set, get) => {
     });
   }
 
+  /* --- v5 macro store sync (dongle is the source of truth) --- */
+
+  /** IO shim handed to the pure transfer helpers in macroSync.ts. */
+  function macroIo(conn: DongleConnection): MacroStoreIO {
+    return {
+      write: (payload) => conn.macroStoreWrite(payload),
+      read: () => conn.macroStoreRead(),
+      getRoundtrip: (payload) => conn.macroStoreGetRoundtrip(payload),
+    };
+  }
+
+  /** True when macro store ops can run right now. */
+  function macroStoreOnline(): boolean {
+    return (
+      dongle !== null &&
+      dongle.supportsMacroStore &&
+      get().connection === 'connected' &&
+      get().macroStoreSupported
+    );
+  }
+
+  /** Persist the macro list to the localStorage read-through cache. */
+  function cacheMacros(macros: Macro[]): void {
+    saveMacros(macros);
+    set({ macros });
+  }
+
+  /**
+   * Push every slotless macro (local draft) into the dongle store, first-fit
+   * by free slot, respecting the 16-slot / 16 KB limits. Returns the updated
+   * store usage; drafts that don't fit (or whose write fails) stay slotless.
+   */
+  async function pushDrafts(
+    conn: DongleConnection,
+    existing: MacroListEntry[],
+    drafts: Macro[],
+  ): Promise<{ pushed: Macro[]; failed: Macro[]; used: number }> {
+    const io = macroIo(conn);
+    const candidates = drafts.map((d) => ({
+      name: d.name,
+      templateByteLen: compiledLength(d.template),
+    }));
+    const plan = planCopy(candidates, existing);
+    const pushed: Macro[] = [];
+    const failed: Macro[] = [];
+    let used = storageUsed(existing);
+    for (const { candidate, slot } of plan.placements) {
+      const draft = drafts[candidate];
+      try {
+        await pushMacro(io, slot, draft.name, encodeMacro(draft.template));
+        used += macroFootprint(draft.name, candidates[candidate].templateByteLen);
+        pushed.push({ ...draft, slot });
+      } catch {
+        failed.push(draft);
+      }
+    }
+    for (const skipped of plan.skipped) failed.push(drafts[skipped]);
+    return { pushed, failed, used };
+  }
+
+  /**
+   * Full sync on connect: apply offline-delete tombstones, detect the
+   * migration case (empty dongle + never-synced locals → banner instead of
+   * auto-copy), merge dongle state into the UI list (dongle wins), and push
+   * offline drafts into free slots.
+   */
+  async function syncMacroStore(conn: DongleConnection): Promise<void> {
+    if (!conn.supportsMacroStore) return;
+    macroSyncInProgress = true;
+    set({ macroSyncing: true });
+    try {
+      const io = macroIo(conn);
+
+      // 1. Offline deletions/edits recorded as tombstones → del ops first.
+      const tombstones = loadTombstones();
+      if (tombstones.length > 0) {
+        const entries = parseMacroList((await conn.readMacroList()) ?? '[]');
+        for (const t of tombstones) {
+          const hit = entries.find((e) => e.name === t.name && e.len === t.len);
+          if (hit) await conn.macroStoreWrite(encodeDelete(hit.i));
+        }
+        saveTombstones([]);
+      }
+
+      // 2. Snapshot the store.
+      const entries = parseMacroList((await conn.readMacroList()) ?? '[]');
+      const locals = get().macros;
+
+      // 3. Migration: v3/v4 user meeting a v5 dongle for the first time.
+      //    Don't auto-copy — surface the one-tap banner instead.
+      if (entries.length === 0 && locals.length > 0 && locals.every((m) => m.slot === undefined)) {
+        set({ migrationAvailable: true, macroStorageUsed: 0 });
+        return;
+      }
+      set({ migrationAvailable: false });
+
+      // 4. Merge dongle macros (dongle wins). Skip the fetch when the cached
+      //    macro's signature (name + compiled length) still matches — that
+      //    also preserves the original template text ({{fields}}, {click}
+      //    landmarks) which the stored byte stream cannot represent.
+      const merged: Macro[] = [];
+      const matched = new Set<string>();
+      for (const e of entries) {
+        const local = locals.find((m) => m.slot === e.i && !matched.has(m.id));
+        if (local && local.name === e.name && compiledLength(local.template) === e.len) {
+          matched.add(local.id);
+          merged.push(local);
+          continue;
+        }
+        const template = bytesToTemplate(await fetchMacroBytes(io, e.i));
+        if (local) {
+          matched.add(local.id);
+          merged.push({ ...local, name: e.name, template, slot: e.i });
+        } else {
+          merged.push({ id: newMacroId(), name: e.name, template, slot: e.i });
+        }
+      }
+
+      // 5. Everything else local is a draft → push into free slots.
+      const drafts = locals.filter((m) => !matched.has(m.id)).map((m) => ({ ...m, slot: undefined }));
+      const { pushed, failed, used } = await pushDrafts(conn, entries, drafts);
+
+      cacheMacros([...merged, ...pushed, ...failed]);
+      set({
+        macroStorageUsed: used,
+        macroNotice:
+          failed.length > 0
+            ? `${failed.length} macro(s) didn't fit on the dongle — kept on this phone only.`
+            : null,
+      });
+    } catch (e) {
+      // A sync failure must not break the connection; the cache stays valid.
+      set({ error: describeBleError(e).message });
+    } finally {
+      macroSyncInProgress = false;
+      set({ macroSyncing: false });
+      if (macroResyncNeeded) {
+        // Something asked for a sync while this one ran — do a full pass
+        // (a read-only refresh could miss drafts waiting to be pushed).
+        macroResyncNeeded = false;
+        const current = dongle;
+        if (current?.supportsMacroStore) void syncMacroStore(current);
+      }
+    }
+  }
+
+  /**
+   * Ask for a full sync after a local change (new/edited/duplicated/imported
+   * drafts). No-op offline — drafts wait for the next connect. Overlapping
+   * requests collapse into one follow-up sync.
+   */
+  function requestMacroSync(): void {
+    if (!macroStoreOnline()) return;
+    if (macroSyncInProgress) {
+      macroResyncNeeded = true;
+      return;
+    }
+    void syncMacroStore(dongle!);
+  }
+
+  /**
+   * Notification-driven refresh (MACRO_LIST fires on every store change).
+   * Read-only: re-fetches only slots whose signature changed, marks macros
+   * whose slot vanished as drafts. Never pushes — that's connect-time work.
+   */
+  async function refreshMacroStore(): Promise<void> {
+    const conn = dongle;
+    if (!conn || !conn.supportsMacroStore) return;
+    if (macroSyncInProgress) {
+      macroResyncNeeded = true;
+      return;
+    }
+    macroSyncInProgress = true;
+    try {
+      const io = macroIo(conn);
+      const entries = parseMacroList((await conn.readMacroList()) ?? '[]');
+      const locals = get().macros;
+      const next: Macro[] = [];
+      const matched = new Set<string>();
+      for (const e of entries) {
+        const local = locals.find((m) => m.slot === e.i && !matched.has(m.id));
+        if (local && local.name === e.name && compiledLength(local.template) === e.len) {
+          matched.add(local.id);
+          next.push(local);
+          continue;
+        }
+        const template = bytesToTemplate(await fetchMacroBytes(io, e.i));
+        if (local) {
+          matched.add(local.id);
+          next.push({ ...local, name: e.name, template, slot: e.i });
+        } else {
+          next.push({ id: newMacroId(), name: e.name, template, slot: e.i });
+        }
+      }
+      // Unmatched locals: drafts stay drafts; a macro whose dongle slot
+      // vanished reverts to a draft (re-pushed on next connect).
+      for (const m of locals) {
+        if (!matched.has(m.id)) next.push({ ...m, slot: undefined });
+      }
+      cacheMacros(next);
+      set({ macroStorageUsed: storageUsed(entries), migrationAvailable: false });
+    } catch {
+      /* best-effort refresh — the next connect re-syncs fully */
+    } finally {
+      macroSyncInProgress = false;
+    }
+  }
+
   /**
    * Prepend a 0x81 sticky-arm sequence when modifiers are armed, and
    * disarm them: the arm applies to the next keystroke only, so it must
@@ -248,6 +515,12 @@ export const useAppStore = create<AppState>((set, get) => {
     defaultOneFinger: loadOneFinger(),
     calibration: loadCalibration(initialDeviceKey) ?? IDENTITY_MAP,
     landmarks: loadLandmarks(initialDeviceKey),
+    macros: loadMacros(),
+    macroStoreSupported: false,
+    macroSyncing: false,
+    macroStorageUsed: 0,
+    migrationAvailable: false,
+    macroNotice: null,
 
     setMode(mode) {
       set({ mode });
@@ -316,6 +589,9 @@ export const useAppStore = create<AppState>((set, get) => {
               bonded: false,
               dongleStatus: 'idle',
               deviceNameSupported: false,
+              macroStoreSupported: false,
+              macroSyncing: false,
+              migrationAvailable: false,
               // The dongle drops held modifiers on disconnect; mirror that.
               modifiers: { ...MODIFIERS_OFF },
             });
@@ -327,9 +603,22 @@ export const useAppStore = create<AppState>((set, get) => {
           bonded: true,
           dongleStatus: 'idle',
           deviceNameSupported: conn.supportsDeviceName,
+          macroStoreSupported: conn.supportsMacroStore,
         });
         loadDeviceState();
         void get().refreshDeviceName();
+        if (conn.supportsMacroStore) {
+          // v5: the dongle owns the macro store. Sync now and re-sync
+          // (read-only) whenever MACRO_LIST notifies.
+          void conn
+            .subscribeMacroList(() => {
+              if (dongle === conn) void refreshMacroStore();
+            })
+            .catch(() => {
+              /* notifications are a convenience; the connect-time sync stands */
+            });
+          void syncMacroStore(conn);
+        }
       } catch (e) {
         const { message } = describeBleError(e);
         set({
@@ -350,6 +639,9 @@ export const useAppStore = create<AppState>((set, get) => {
         bonded: false,
         dongleStatus: 'idle',
         deviceNameSupported: false,
+        macroStoreSupported: false,
+        macroSyncing: false,
+        migrationAvailable: false,
         modifiers: { ...MODIFIERS_OFF },
       });
     },
@@ -514,6 +806,147 @@ export const useAppStore = create<AppState>((set, get) => {
 
     clearError() {
       set({ error: null, pairingHint: false });
+    },
+
+    saveMacroEdit(editing, name, template) {
+      const macros = get().macros;
+      if (editing && editing.slot !== undefined) {
+        // The macro lives on the dongle. Tombstone the stale dongle copy so
+        // the next sync deletes it; it is either rewritten in place (online)
+        // or re-pushed as a draft (offline / failed write).
+        const tombstone = { name: editing.name, len: compiledLength(editing.template) };
+        const conn = dongle;
+        if (conn && macroStoreOnline()) {
+          cacheMacros(macros.map((m) => (m.id === editing.id ? { ...m, name, template } : m)));
+          const slot = editing.slot;
+          void (async () => {
+            try {
+              // A put to an existing slot overwrites it in place.
+              await pushMacro(macroIo(conn), slot, name, encodeMacro(template));
+            } catch {
+              addTombstone(tombstone);
+              cacheMacros(
+                get().macros.map((m) => (m.id === editing.id ? { ...m, slot: undefined } : m)),
+              );
+              set({
+                macroNotice: `"${name}" could not be written to the dongle — kept on this phone.`,
+              });
+              return;
+            }
+            await refreshMacroStore();
+          })();
+          return;
+        }
+        addTombstone(tombstone);
+        cacheMacros(
+          macros.map((m) => (m.id === editing.id ? { ...m, name, template, slot: undefined } : m)),
+        );
+        return;
+      }
+      if (editing) {
+        cacheMacros(macros.map((m) => (m.id === editing.id ? { ...m, name, template } : m)));
+      } else {
+        cacheMacros([...macros, { id: newMacroId(), name, template }]);
+      }
+      requestMacroSync();
+    },
+
+    deleteMacro(macro) {
+      cacheMacros(get().macros.filter((m) => m.id !== macro.id));
+      if (macro.slot === undefined) return; // local draft — nothing on the dongle
+      const tombstone = { name: macro.name, len: compiledLength(macro.template) };
+      const conn = dongle;
+      if (!conn || !macroStoreOnline()) {
+        addTombstone(tombstone);
+        return;
+      }
+      const slot = macro.slot;
+      void (async () => {
+        try {
+          await conn.macroStoreWrite(encodeDelete(slot));
+        } catch {
+          addTombstone(tombstone); // retry through the next connect-time sync
+          return;
+        }
+        await refreshMacroStore();
+      })();
+    },
+
+    duplicateMacro(macro) {
+      cacheMacros([
+        ...get().macros,
+        { id: newMacroId(), name: `${macro.name} (copy)`, template: macro.template },
+      ]);
+      requestMacroSync();
+    },
+
+    importMacros(items) {
+      cacheMacros([
+        ...get().macros,
+        ...items.map((m) => ({ id: newMacroId(), name: m.name, template: m.template })),
+      ]);
+      requestMacroSync();
+    },
+
+    async copyMacrosToDongle() {
+      const conn = dongle;
+      if (!conn || !macroStoreOnline()) return;
+      set({ migrationAvailable: false, macroSyncing: true });
+      try {
+        const entries = parseMacroList((await conn.readMacroList()) ?? '[]');
+        const drafts = get().macros.filter((m) => m.slot === undefined);
+        const { pushed, failed } = await pushDrafts(conn, entries, drafts);
+        // Reflect the assigned slots before refreshing, so the refresh
+        // matches pushed macros instead of duplicating them.
+        cacheMacros([...get().macros.filter((m) => m.slot !== undefined), ...pushed, ...failed]);
+        await refreshMacroStore();
+        set({
+          macroNotice:
+            failed.length > 0
+              ? `${failed.length} macro(s) didn't fit on the dongle — kept on this phone only.`
+              : 'Macros copied to the dongle.',
+        });
+      } catch (e) {
+        set({ error: describeBleError(e).message });
+      } finally {
+        set({ macroSyncing: false });
+      }
+    },
+
+    makeButtonMacro(macro) {
+      const conn = dongle;
+      if (!conn || !macroStoreOnline()) {
+        set({ macroNotice: 'Connect to the dongle to choose the button macro.' });
+        return;
+      }
+      if (macro.slot === 0) return;
+      // Slot 0 is a plain store slot: write this macro there, free its old
+      // slot, and demote the previous slot-0 macro to a draft (the follow-up
+      // sync pushes it into a free slot).
+      const oldSlot = macro.slot;
+      cacheMacros(
+        get().macros.map((m) => {
+          if (m.id === macro.id) return { ...m, slot: 0 };
+          if (m.slot === 0) return { ...m, slot: undefined };
+          return m;
+        }),
+      );
+      void (async () => {
+        try {
+          await pushMacro(macroIo(conn), 0, macro.name, encodeMacro(macro.template));
+          if (oldSlot !== undefined) {
+            await conn.macroStoreWrite(encodeDelete(oldSlot));
+          }
+          await refreshMacroStore();
+          requestMacroSync();
+        } catch (e) {
+          set({ error: describeBleError(e).message });
+        }
+      })();
+    },
+
+    dismissMacroNotice() {
+      set({ macroNotice: null });
     },
   };
 });

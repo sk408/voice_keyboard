@@ -22,6 +22,7 @@ import {
   chunkPayload,
   parseStatus,
 } from './protocol';
+import { MACRO_LIST_UUID, MACRO_RW_UUID } from './macroSync';
 
 export type StatusListener = (status: 'idle' | 'busy' | 'error') => void;
 export type DisconnectListener = () => void;
@@ -39,6 +40,12 @@ export class DongleConnection {
   private rx: BluetoothRemoteGATTCharacteristic | null = null;
   /** v3 config characteristic (device name); null on v2 firmware. */
   private config: BluetoothRemoteGATTCharacteristic | null = null;
+  /** v5 macro store characteristics; null on pre-v5 firmware. */
+  private macroList: BluetoothRemoteGATTCharacteristic | null = null;
+  private macroRw: BluetoothRemoteGATTCharacteristic | null = null;
+  private macroListListener: ((event: Event) => void) | null = null;
+  /** Serializes MACRO_RW write+read pairs so chunked gets never interleave. */
+  private macroQueue: Promise<void> = Promise.resolve();
   private queue: Promise<void> = Promise.resolve();
 
   private constructor(private device: BluetoothDevice) {}
@@ -84,7 +91,7 @@ export class DongleConnection {
     filters.push({ namePrefix: ADVERTISED_NAME_PREFIX });
     return navigator.bluetooth.requestDevice({
       filters,
-      optionalServices: [NUS_SERVICE_UUID, CONFIG_CHAR_UUID],
+      optionalServices: [NUS_SERVICE_UUID, CONFIG_CHAR_UUID, MACRO_LIST_UUID, MACRO_RW_UUID],
     });
   }
 
@@ -137,6 +144,16 @@ export class DongleConnection {
     } catch {
       this.config = null;
     }
+
+    // v5 macro store characteristics. Pre-v5 dongles don't have them —
+    // tolerate the absence; the app then falls back to localStorage macros.
+    try {
+      this.macroList = await service.getCharacteristic(MACRO_LIST_UUID);
+      this.macroRw = await service.getCharacteristic(MACRO_RW_UUID);
+    } catch {
+      this.macroList = null;
+      this.macroRw = null;
+    }
   }
 
   /** True when the connected firmware exposes the v3 config characteristic. */
@@ -163,6 +180,77 @@ export class DongleConnection {
     await this.config.writeValueWithResponse(new Uint8Array(new TextEncoder().encode(name)));
   }
 
+  /** True when the connected firmware exposes the v5 macro store. */
+  get supportsMacroStore(): boolean {
+    return this.macroList !== null && this.macroRw !== null;
+  }
+
+  /** Raw MACRO_LIST value (JSON text). Null when unsupported/disconnected. */
+  async readMacroList(): Promise<string | null> {
+    if (!this.macroList || !this.connected) return null;
+    const value = await this.macroList.readValue();
+    return new TextDecoder().decode(value);
+  }
+
+  /**
+   * Subscribe to MACRO_LIST notifications (fired by the dongle on every
+   * store change). One listener at a time; a new subscription replaces the
+   * old. No-op on pre-v5 firmware.
+   */
+  async subscribeMacroList(listener: () => void): Promise<void> {
+    if (!this.macroList || !this.connected) return;
+    if (this.macroListListener) {
+      this.macroList.removeEventListener('characteristicvaluechanged', this.macroListListener);
+    }
+    this.macroListListener = () => listener();
+    this.macroList.addEventListener('characteristicvaluechanged', this.macroListListener);
+    await this.macroList.startNotifications();
+  }
+
+  /**
+   * Write one MACRO_RW payload (put/del). Serialized through the macro queue
+   * so it never interleaves with another macro operation.
+   */
+  macroStoreWrite(payload: Uint8Array): Promise<void> {
+    return this.macroEnqueue(async () => {
+      if (!this.macroRw || !this.connected) throw new Error('Dongle is not connected');
+      await this.macroRw.writeValueWithResponse(new Uint8Array(payload));
+    });
+  }
+
+  /** Read one MACRO_RW response chunk (JSON text) after a get request. */
+  macroStoreRead(): Promise<string> {
+    return this.macroEnqueue(async () => {
+      if (!this.macroRw || !this.connected) throw new Error('Dongle is not connected');
+      const value = await this.macroRw.readValue();
+      return new TextDecoder().decode(value);
+    });
+  }
+
+  /**
+   * Atomic get round-trip: write the get request and read its response as a
+   * single queued unit. A chunked get must use this rather than separate
+   * write/read calls — those are independent queue entries, and another
+   * macro write enqueued between them would consume the pending get state.
+   */
+  macroStoreGetRoundtrip(payload: Uint8Array): Promise<string> {
+    return this.macroEnqueue(async () => {
+      if (!this.macroRw || !this.connected) throw new Error('Dongle is not connected');
+      await this.macroRw.writeValueWithResponse(new Uint8Array(payload));
+      const value = await this.macroRw.readValue();
+      return new TextDecoder().decode(value);
+    });
+  }
+
+  private macroEnqueue<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.macroQueue.then(op);
+    this.macroQueue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
   private onDisconnect: DisconnectListener = () => {};
   private handleDisconnect = () => {
     // Stop listening: a DongleConnection is single-use, and a stale
@@ -171,6 +259,9 @@ export class DongleConnection {
     this.device.removeEventListener('gattserverdisconnected', this.handleDisconnect);
     this.rx = null;
     this.config = null;
+    this.macroList = null;
+    this.macroRw = null;
+    this.macroListListener = null;
     this.onDisconnect();
   };
 

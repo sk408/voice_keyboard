@@ -1,4 +1,4 @@
-# Voice Keyboard BLE Protocol v4
+# Voice Keyboard BLE Protocol v5
 
 Contract between the nRF52840 dongle (BLE peripheral, USB HID keyboard toward PC)
 and any central client (web app now; native Android/iOS apps later).
@@ -22,7 +22,7 @@ Standard NUS UUIDs so generic BLE UART libraries/apps work out of the box:
 | RX (central→dongle) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write-no-resp | keystroke payload |
 | TX (dongle→central) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | status bytes |
 
-Also standard DIS (0x180A) with Firmware Revision String = `vk-4.0`.
+Also standard DIS (0x180A) with Firmware Revision String = `vk-5.0`.
 
 ## GATT — config characteristic (v3)
 
@@ -41,9 +41,9 @@ One vendor characteristic on the same (NUS-UUID) service:
   characteristic updates immediately. Default name: `VoiceKB`.
 - Read returns the current name (no NUL terminator).
 - Like RX, both read and write require the encrypted/bonded link.
-- Macros (see the web app) are purely an app-side composition feature: they
-  compile to the ordinary RX byte stream above and need no firmware support
-  beyond this characteristic.
+- In v3/v4, macros were purely an app-side composition feature (compiled to
+  the ordinary RX byte stream). Since v5 they can also live on the dongle —
+  see the v5 section below.
 
 ## RX payload (typing)
 
@@ -55,20 +55,48 @@ Stream of bytes, any chunking; dongle types as received, rate-limited (~15 ms/ke
   - `0x01` Esc, `0x02` Up, `0x03` Down, `0x04` Left, `0x05` Right,
     `0x06` Delete, `0x07` Home, `0x08` End, `0x09` PageUp, `0x0A` PageDown,
     `0x10`–`0x1B` F1–F12
+
 ## RX payload — v5 extensions (dongle-stored macros)
 
 The dongle is the source of truth for user macros (flash-persisted, like bonds/name).
 Any client connects and reads the same library.
 
-- **Macro store characteristics** on the custom service (UUIDs registered in v5 firmware README):
-  - MACRO_LIST (read, notify): JSON array `[{"i":0,"name":"SOAP note","len":412}, ...]`
-  - MACRO_RW (write-with-response + read): chunked transfer —
-    - Write: `{"op":"put","i":0,"name":"...","off":0,"data":"<utf8 chunk>"}`; chunks ≤180 B,
-      `off` cumulative; final chunk has `"fin":true`. `{"op":"del","i":2}` deletes.
-    - Read: `{"op":"get","i":0,"off":0}` → response/notify returns the same chunk shape.
-  - Capacity: 16 macros, 16 KB total flash budget (documented; firmware rejects with error notify `0xE1` full).
-- **Standalone trigger** (optional v5 feature): long-press (>1.5 s) the dongle button with no BLE
-  connection plays macro index 0 over USB. Short press remains the pairing window.
+- **Macro store characteristics** on the same (NUS-UUID) service, same vendor
+  UUID base as the config characteristic, both encrypted-link only:
+
+| Role | UUID | Properties | Notes |
+|---|---|---|---|
+| MACRO_LIST | `5A1B0002-8C4D-4E2F-9A3B-7C6D5E4F3A2B` | read, notify | JSON macro list |
+| MACRO_RW | `5A1B0003-8C4D-4E2F-9A3B-7C6D5E4F3A2B` | write-with-response, read | chunked put/get/del |
+
+- MACRO_LIST value: JSON array `[{"i":0,"name":"SOAP note","len":412}, ...]`
+  (`[]` when empty; `len` = template byte length). A notify fires on every
+  completed store change (put/del); if the list outgrows the ATT MTU the
+  notification is dropped — the value can always be read.
+- MACRO_RW chunked transfer (each ATT payload ≤180 B):
+  - Put: `{"op":"put","i":0,"name":"...","off":0,"data":"..."}` — `off` is the
+    cumulative byte offset into the template; the final chunk adds
+    `"fin":true`. `name` only on the first chunk (`off`=0). A new `off`=0
+    chunk restarts an interrupted put; a disconnect aborts it. An empty
+    template (`fin` with no data) deletes the slot.
+  - Delete: `{"op":"del","i":2}` (deleting an empty slot is a no-op).
+  - Get: write `{"op":"get","i":0,"off":N}`, then read →
+    `{"op":"get","i":0,"off":N,"len":TOTAL,"data":"..."}` plus `"fin":true`
+    on the last chunk (a read with no preceding get returns `{}`).
+- **`data` encoding (client contract)**: the template is an arbitrary byte
+  stream (UTF-8 text + pre-encoded `0x00` escape tokens — the dongle never
+  interprets it, playback feeds the same typing-engine path as RX bytes).
+  Each byte maps to its own JSON-string representation: printable safe ASCII
+  passes through, `"` and `\` use the standard JSON escapes, every other
+  byte becomes one `\u00XX` escape (strict JSON both directions). Because
+  the mapping is per-byte, chunk boundaries may fall anywhere —
+  mid-UTF-8-character or mid-escape-sequence.
+- Capacity: 16 slots (indices 0–15), name ≤24 UTF-8 bytes, 16 KB total flash
+  budget. A put that would exceed the budget fails the ATT write and sends
+  error notify `0xE1` on NUS TX.
+- **Standalone trigger**: long-press (>1.5 s) the dongle button with no BLE
+  connection plays macro index 0 over USB (6-blink LED code; no-op when slot 0
+  is empty). Short press remains the pairing window.
 
 ## RX payload — v2 extensions (modifiers + relative mouse)
   - `0x00 0x81 <bitmask>` = sticky-arm modifiers for the NEXT key only (then auto-release)

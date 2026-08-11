@@ -61,6 +61,24 @@ void typing_feed(const void *data, uint16_t len)
 	}
 }
 
+void typing_play(const void *data, uint16_t len)
+{
+	const uint8_t *p = data;
+
+	while (len > 0) {
+		uint32_t written = ring_buf_put(&rx_ring, p, len);
+
+		p += written;
+		len -= written;
+		if (written > 0) {
+			k_sem_give(&rx_sem);
+		}
+		if (len > 0) {
+			k_msleep(20); /* wait for the typing thread to drain */
+		}
+	}
+}
+
 void typing_reset(void)
 {
 	k_sem_reset(&rx_sem);

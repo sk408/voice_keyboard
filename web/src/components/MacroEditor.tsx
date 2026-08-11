@@ -18,7 +18,9 @@ export default function MacroEditor({ initial, onSave, onCancel }: Props) {
   const [name, setName] = useState(initial?.name ?? '');
   const [template, setTemplate] = useState(initial?.template ?? '');
 
-  const canSave = name.trim().length > 0 && template.length > 0;
+  // The dongle store caps names at 24 UTF-8 bytes (firmware limit).
+  const nameBytes = new TextEncoder().encode(name.trim()).length;
+  const canSave = name.trim().length > 0 && nameBytes <= 24 && template.length > 0;
 
   return (
     <div className="input-panel">
@@ -26,9 +28,11 @@ export default function MacroEditor({ initial, onSave, onCancel }: Props) {
         className="text-input"
         placeholder="Macro name"
         value={name}
-        maxLength={60}
         onChange={(e) => setName(e.target.value)}
       />
+      {nameBytes > 24 && (
+        <div className="macro-hint">Name is {nameBytes}/24 bytes — shorten it.</div>
+      )}
       <textarea
         className="type-area macro-template"
         placeholder={'Template, e.g. Dear {{name}},{enter}{enter}…'}

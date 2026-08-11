@@ -4,7 +4,8 @@
  * RX writes, LE bonding with a 60 s pairing window after a button press,
  * and bond persistence via the settings subsystem. v3 adds a config
  * characteristic (custom 128-bit UUID) for a user-settable, settings-
- * persisted device name. See PROTOCOL.md.
+ * persisted device name. v5 adds the MACRO_LIST/MACRO_RW characteristics
+ * (dongle-stored macros, see macro.c). See PROTOCOL.md.
  */
 
 #include <zephyr/kernel.h>
@@ -34,6 +35,11 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 /* v3 config characteristic: user-settable device name (see PROTOCOL.md). */
 #define VKB_UUID_CONFIG \
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0001, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
+/* v5 macro store characteristics (same vendor base as the config char). */
+#define VKB_UUID_MACRO_LIST \
+	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0002, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
+#define VKB_UUID_MACRO_RW \
+	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0003, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
 
 #define DEVICE_NAME_MAX		20	/* protocol limit: 1..20 printable ASCII */
 #define DEVICE_NAME_DEFAULT	"VoiceKB"
@@ -173,6 +179,44 @@ static int vkb_settings_set(const char *key, size_t len,
 
 SETTINGS_STATIC_HANDLER_DEFINE(vkb, "vkb", NULL, vkb_settings_set, NULL, NULL);
 
+/* --- v5 macro store characteristics (logic lives in macro.c) --- */
+
+static ssize_t macro_list_read(struct bt_conn *conn,
+			       const struct bt_gatt_attr *attr,
+			       void *buf, uint16_t len, uint16_t offset)
+{
+	uint16_t json_len;
+	const uint8_t *json = macro_list_json(&json_len);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, json, json_len);
+}
+
+static ssize_t macro_rw_read(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset)
+{
+	uint16_t resp_len;
+	const uint8_t *resp = macro_get_response(&resp_len);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, resp, resp_len);
+}
+
+static ssize_t macro_rw_write(struct bt_conn *conn,
+			      const struct bt_gatt_attr *attr,
+			      const void *buf, uint16_t len,
+			      uint16_t offset, uint8_t flags)
+{
+	ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(flags);
+
+	if (offset != 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	int err = macro_write(buf, len);
+
+	return err ? BT_GATT_ERR(-err) : len;
+}
+
 BT_GATT_SERVICE_DEFINE(nus_svc,
 	BT_GATT_PRIMARY_SERVICE(VKB_UUID_NUS_SERVICE),
 	BT_GATT_CHARACTERISTIC(VKB_UUID_NUS_TX,
@@ -189,6 +233,15 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 		BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 		BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
 		config_read, config_write, NULL),
+	BT_GATT_CHARACTERISTIC(VKB_UUID_MACRO_LIST,
+		BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+		BT_GATT_PERM_READ_ENCRYPT,
+		macro_list_read, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+	BT_GATT_CHARACTERISTIC(VKB_UUID_MACRO_RW,
+		BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+		BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
+		macro_rw_read, macro_rw_write, NULL),
 );
 
 /* Advertising data is rebuilt from device_name on every (re)start, so a
@@ -324,6 +377,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	tx_notif_enabled = false;
 	typing_reset();
+	macro_abort_put();
 	start_advertising();
 }
 
@@ -364,12 +418,38 @@ void ble_notify_status(uint8_t status)
 	 *   attrs[0] primary service, attrs[1] TX declaration,
 	 *   attrs[2] TX value, attrs[3] TX CCC,
 	 *   attrs[4] RX declaration, attrs[5] RX value,
-	 *   attrs[6] config declaration, attrs[7] config value (v3).
+	 *   attrs[6] config declaration, attrs[7] config value (v3),
+	 *   attrs[8] MACRO_LIST declaration, attrs[9] MACRO_LIST value,
+	 *   attrs[10] MACRO_LIST CCC (v5),
+	 *   attrs[11] MACRO_RW declaration, attrs[12] MACRO_RW value (v5).
 	 * Notifications must be sent on the VALUE attribute (attrs[2]);
 	 * using attrs[1] notifies the declaration handle, which no central
 	 * subscribes to, so every status byte is silently dropped.
 	 */
 	bt_gatt_notify(current_conn, &nus_svc.attrs[2], &status, sizeof(status));
+}
+
+bool ble_is_connected(void)
+{
+	return current_conn != NULL;
+}
+
+void ble_notify_macro_list(const uint8_t *json, uint16_t len)
+{
+	if (!current_conn) {
+		return;
+	}
+
+	/* MACRO_LIST value attribute (see layout above). NULL conn notifies
+	 * every peer that enabled the CCC. If the list outgrows the ATT MTU
+	 * the notification is dropped (best effort); the list can always be
+	 * read back from the characteristic itself.
+	 */
+	int err = bt_gatt_notify(NULL, &nus_svc.attrs[9], json, len);
+
+	if (err) {
+		LOG_WRN("MACRO_LIST notify failed (%d)", err);
+	}
 }
 
 int ble_init(void)
@@ -385,6 +465,8 @@ int ble_init(void)
 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
 		settings_load();
 	}
+	/* Assemble settings-restored macro chunks (no-op when none). */
+	macro_boot_finalize();
 
 	/* Reflect the (possibly settings-restored) name in the GAP Device
 	 * Name characteristic; advertising data picks it up below.

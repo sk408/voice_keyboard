@@ -10,4 +10,5 @@ target_sources(app PRIVATE
   src/usb_kbd.c
   src/ble.c
   src/typing.c
+  src/macro.c
 )
