@@ -2,6 +2,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/fatal.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -65,6 +66,84 @@ void app_boot_stage(uint8_t stage)
 		k_msleep(80);
 	}
 	k_msleep(300); /* gap between stage codes */
+}
+
+/* Boot sub-stage markers (v5.2): long (400 ms) red blinks, used for the
+ * sub-steps inside ble_init()'s bt_enable() path that the short stage
+ * codes can't distinguish. See DEBUG_NOTES.md.
+ */
+void app_boot_mark(uint8_t count)
+{
+	if (dbg_led.port == NULL) {
+		return;
+	}
+
+	for (uint8_t i = 0; i < count; i++) {
+		gpio_pin_set_dt(&dbg_led, 1);
+		k_msleep(400);
+		gpio_pin_set_dt(&dbg_led, 0);
+		k_msleep(400);
+	}
+	k_msleep(300);
+}
+
+/* Repeating fast blink: bt_enable() returned an error. Never returns. */
+void app_boot_error_bt(void)
+{
+	for (;;) {
+		if (dbg_led.port != NULL) {
+			gpio_pin_set_dt(&dbg_led, 1);
+			k_msleep(100);
+			gpio_pin_set_dt(&dbg_led, 0);
+		}
+		k_msleep(100);
+	}
+}
+
+/* Repeating 3-long-blink group: settings storage unrecoverable even
+ * after erasing the partition. Never returns.
+ */
+void app_boot_error_settings(void)
+{
+	for (;;) {
+		if (dbg_led.port != NULL) {
+			for (uint8_t i = 0; i < 3; i++) {
+				gpio_pin_set_dt(&dbg_led, 1);
+				k_msleep(400);
+				gpio_pin_set_dt(&dbg_led, 0);
+				k_msleep(400);
+			}
+		}
+		k_msleep(1200);
+	}
+}
+
+/* Fatal-error handler (v5.2): a fault anywhere — including inside
+ * bt_enable(), where the boot-stage trace can't see it — used to die
+ * silently with the red LED frozen at the last stage code (no reset:
+ * CONFIG_RESET_ON_FAULT=n). Signal it with a continuous slow (1 s) red
+ * blink instead. Interrupts may be disabled here, so busy-wait, never
+ * k_msleep().
+ */
+void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
+{
+	ARG_UNUSED(esf);
+
+	LOG_ERR("Fatal error %u", reason);
+
+	if (dbg_led.port != NULL) {
+		gpio_pin_configure_dt(&dbg_led, GPIO_OUTPUT_INACTIVE);
+		for (;;) {
+			gpio_pin_set_dt(&dbg_led, 1);
+			k_busy_wait(1000000);
+			gpio_pin_set_dt(&dbg_led, 0);
+			k_busy_wait(1000000);
+		}
+	}
+
+	for (;;) {
+		/* halt */
+	}
 }
 
 void app_led_debug(enum app_led_code code)

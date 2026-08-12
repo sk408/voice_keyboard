@@ -248,6 +248,58 @@ Two changes ship for that:
 budget 16 KB across 16 slots, leaving 16 KB of NVS headroom for bonds, the
 device name, and GC. RAM 116 KB/256 KB (44 %).
 
+## v5.2: root cause found — NVS mount inside `bt_enable()` aborts it
+
+Hardware observation on v5.1: the boot-stage trace stops at **2 blinks** —
+death inside `bt_enable()`. The v5.1 write-up above concluded "bounded even
+on garbage flash" for NVS and looked only for a *hang*. The miss: NVS being
+bounded doesn't help when the mount **fails** — because of where the mount
+happens in Zephyr 4.1:
+
+`bt_enable()` → `bt_init()` → `bt_settings_init()` →
+`settings_subsys_init()` → NVS **mount on the storage partition, inside
+`bt_enable()`** (hci_core.c, settings.c). With
+`CONFIG_NVS_INIT_BAD_MEMORY_REGION=n`, flash that isn't a recognizable NVS
+(e.g. every sector's closing-ATE slot non-erased → "all sectors closed")
+fails the mount with `-EDEADLK`, `bt_init()` propagates the error,
+`bt_enable()` returns it, `ble_init()` returns it, `main()` returns — red
+LED frozen at 2 blinks, no advertising, no BLE. Exactly the observed
+symptom, no hang required.
+
+Why v5 introduced it and v4 didn't hit it: v4's storage partition was the
+stock `0xDC000` region, initialized as NVS by v2/v3 long ago — clean mount
+every boot. v5 moved storage to `0xB4000`, a region that was previously
+*legal app space* (v4 allowed images up to `0x26000+0xCE000 = 0xF4000`) and
+may carry old app tails or DFU residue — garbage from NVS's point of view.
+The v5.1 DLE pin (`BT_CTLR_DATA_LENGTH_MAX=27`) was a red herring: it
+addressed an on-air link-layer theory, but the boot never gets on-air.
+
+Fix (this commit): `ble_init()` mounts the settings backend **itself**
+before `bt_enable()` (`settings_subsys_init()`); on failure it erases the
+whole storage partition (`flash_area_flatten()`) and retries, so the mount
+always sees a valid, empty NVS and `bt_enable()`'s internal mount becomes a
+no-op. A repair erase loses bonds/name — re-pair once. The custom device
+name feature (v3) was re-audited against this failure mode: its settings
+handler and `bt_set_name()` run only *after* stage 3, so it is not on the
+`bt_enable()` path and is left intact.
+
+### New red-LED codes (v5.2)
+
+Short blinks stay the stage codes above. Long blinks (400 ms) are
+sub-stages inside the `bt_enable()` path; repeating patterns are
+unrecoverable errors:
+
+| Pattern | Meaning |
+|---|---|
+| 1 long blink | settings pre-mount running (normal on every boot) |
+| 2 long blinks | NVS mount failed → storage partition erased, retrying (expected once on dirty flash; re-pair afterwards) |
+| repeating fast blink (100 ms) | `bt_enable()` returned an error *with settings storage OK* — failure is elsewhere in BLE bring-up |
+| repeating 3-long-blink group | settings storage unrecoverable even after a full erase (flash hardware problem) |
+| repeating slow blink (1 s) | **hard fault** (`k_sys_fatal_error_handler` override; previously a fault died silently at the last stage code — `CONFIG_RESET_ON_FAULT=n`) |
+
+Healthy v5.2 boot: 1, 2 short → 1 long → 3, 4, 5 short, then the green
+advertising blink.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

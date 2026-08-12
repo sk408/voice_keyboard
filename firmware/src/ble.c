@@ -14,11 +14,19 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/storage/flash_map.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 
 #include "vkb.h"
+
+/* Zephyr keeps settings_subsys_init() out of the public headers
+ * (subsys/settings/src/settings_init.c). bt_enable() calls it internally
+ * via bt_settings_init(); declared here so ble_init() can mount the
+ * settings backend first — see ble_init().
+ */
+extern int settings_subsys_init(void);
 
 #define PAIRING_WINDOW_SECONDS	60
 
@@ -452,14 +460,58 @@ void ble_notify_macro_list(const uint8_t *json, uint16_t len)
 	}
 }
 
+/* Erase the whole settings storage partition. Used to recover from a
+ * failed NVS mount on flash that previously held something else.
+ */
+static int storage_partition_erase(void)
+{
+	const struct flash_area *fa;
+	int err = flash_area_open(FIXED_PARTITION_ID(storage_partition), &fa);
+
+	if (err) {
+		return err;
+	}
+	err = flash_area_flatten(fa, 0, fa->fa_size);
+	flash_area_close(fa);
+	return err;
+}
+
 int ble_init(void)
 {
 	int err;
 
+	/* v5 moved the settings partition to 0xB4000, a flash region that
+	 * older firmware could legally occupy (v4 allowed app images up to
+	 * 0xF4000) or that may carry DFU residue. bt_enable() ->
+	 * bt_init() -> bt_settings_init() mounts NVS on it and ABORTS
+	 * bt_enable() on any mount error (garbage flash: -EDEADLK, since
+	 * CONFIG_NVS_INIT_BAD_MEMORY_REGION=n) — the boot then dies at
+	 * stage 2 with no BLE (observed on v5/v5.1 hardware). Mount it
+	 * ourselves first; on failure erase the partition and retry, so
+	 * the mount always sees a valid (empty) NVS. A repair erase loses
+	 * bonds/name: re-pair once.
+	 */
+	app_boot_mark(1);
+	err = settings_subsys_init();
+	if (err) {
+		LOG_WRN("Settings mount failed (%d), erasing storage partition",
+			err);
+		app_boot_mark(2);
+		err = storage_partition_erase();
+		if (!err) {
+			err = settings_subsys_init();
+		}
+		if (err) {
+			LOG_ERR("Settings storage unrecoverable (%d)", err);
+			app_boot_error_settings();
+		}
+		LOG_INF("Settings storage repaired");
+	}
+
 	err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("Bluetooth init failed (%d)", err);
-		return err;
+		app_boot_error_bt();
 	}
 	app_boot_stage(3);
 

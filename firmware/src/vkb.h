@@ -25,6 +25,12 @@ enum app_led_code {
 void app_led_debug(enum app_led_code code);
 /* Boot-stage trace (v5.1): red blink N = boot stage N completed. */
 void app_boot_stage(uint8_t stage);
+/* Boot sub-stage markers (v5.2): long (400 ms) blinks, see DEBUG_NOTES.md. */
+void app_boot_mark(uint8_t count);
+/* Repeating fast blink: bt_enable() returned an error. Never returns. */
+void app_boot_error_bt(void);
+/* Repeating 3-long-blink group: settings storage unrecoverable. Never returns. */
+void app_boot_error_settings(void);
 
 /* --- USB HID composite keyboard + mouse (usb_kbd.c) --- */
 int usb_kbd_init(void);

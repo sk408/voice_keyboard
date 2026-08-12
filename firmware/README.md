@@ -139,6 +139,9 @@ are not migrated — re-pair and re-set the name once.
   received, 6 = macro playback started. At boot the red LED also runs a
   stage trace (1→5 blinks in slow groups: main, USB up, BLE up, settings
   loaded, advertising up) — the last group seen pinpoints a boot hang.
+  Long (400 ms) blinks are boot sub-stages on the bt_enable() path, and
+  repeating patterns signal unrecoverable boot errors or hard faults —
+  see DEBUG_NOTES.md (v5.2) for the full table.
 
 ## Pairing / security
 
