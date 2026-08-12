@@ -300,6 +300,62 @@ unrecoverable errors:
 Healthy v5.2 boot: 1, 2 short → 1 long → 3, 4, 5 short, then the green
 advertising blink.
 
+## v5.3: connect fails ("unsupported GATT" in the web app) — bondless dongle rejects every peer
+
+Hardware observation on v5.2: clean boot, green advertising blink, but the
+web app's connect fails with a GATT error and the dongle appears dead.
+
+Static audit (no fault found): the web↔firmware UUIDs match (NUS, config
+`5a1b0001`, MACRO_LIST `5a1b0002`, MACRO_RW `5a1b0003`); the v5 GATT attr
+layout is consistent (`ble_notify_status` → attrs[2], `ble_notify_macro_list`
+→ attrs[9], both VALUE attributes); the config/name read is a bounded
+`bt_gatt_attr_read()` over a 21-byte static buffer; `bt_set_name()` is
+length-checked against `CONFIG_BT_DEVICE_NAME_MAX=28`; the MACRO_LIST CCC's
+NULL changed-callback is NULL-checked in this Zephyr (gatt.c:2194);
+`bt_hci_cmd_send_sync()` from the disconnected callback cannot deadlock
+because CMD_COMPLETE/CMD_STATUS are *prio* events handled in driver RX
+context, not on the BT workqueue. **The custom device-name feature is
+exonerated as the crash mechanism**: nothing in its read/write/boot path
+faults, and its only connect-time effect is being the first *encrypted* GATT
+op — a role the v5 macro characteristics would take over anyway.
+
+The provable failure is the bonded-peer gate: v5 moved the settings
+partition (`0xDC000` → `0xB4000`) and v5.2's repair path erases it, so the
+dongle holds **zero bonds**. `connected()` disconnects any unbonded peer
+while the pairing window is closed (button not pressed), so every web-app
+connect dies during service discovery — Chrome surfaces that as a
+NotSupported/NetworkError ("unsupported GATT") and, with the auto-resumed
+advertising easy to miss, the dongle looks crashed. A phone holding a
+*v2-era stale bond* adds a second failure layer at the first encrypted read
+(the config/name char): encryption with the stale LTK fails and the re-pair
+depends on the phone OS handling it gracefully inside the window.
+
+Fix (this commit):
+
+1. **Bondless recovery**: `ble_init()` counts stored bonds after
+   `settings_load()`; with zero bonds it opens the 60 s pairing window once
+   at boot, so a factory/repaired dongle is pairable without physical
+   button access. The window still auto-closes and the bonded-peer gate is
+   unchanged once a bond exists. After re-pairing, the phone's stale bond
+   should be forgotten once (web app "forget" or OS Bluetooth settings).
+2. **Connect-stage trace** (new red-LED codes below) so the next flash
+   pinpoints the death stage if a real fault remains.
+
+### New red-LED codes (v5.3)
+
+200 ms pulses, distinct from the 60–120 ms RX/HID codes:
+
+| Pattern | Meaning |
+|---|---|
+| 7 blinks | connect reached `connected()` but the peer was **rejected** — no bond and pairing window closed (the bondless case above) |
+| 8 blinks | security/pairing failed (`security_changed` error — e.g. stale phone bond) |
+| 9 blinks | central subscribed to NUS TX (service discovery + subscribe succeeded) |
+| 10 blinks | config (device name) characteristic read — convicts or exonerates the v3 name feature on hardware |
+| repeating slow blink (1 s) | hard fault (unchanged, v5.2) |
+
+Healthy v5.3 connect: green solid, then 9 blinks, then 10 blinks (web app
+reads the name right after subscribing), then usable.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

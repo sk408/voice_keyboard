@@ -174,6 +174,21 @@ void app_led_debug(enum app_led_code code)
 	case APP_LED_MACRO_PLAY:
 		dbg_on_ms = 60; dbg_off_ms = 60; dbg_pulses = 6;
 		break;
+	/* Connect-stage trace (v5.3): longer pulses so the counts stay
+	 * distinguishable from the RX/HID codes above.
+	 */
+	case APP_LED_CONN_REJECT:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 7;
+		break;
+	case APP_LED_SEC_FAIL:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 8;
+		break;
+	case APP_LED_TX_SUB:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 9;
+		break;
+	case APP_LED_NAME_READ:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 10;
+		break;
 	default:
 		return;
 	}

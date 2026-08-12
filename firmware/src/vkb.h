@@ -20,6 +20,11 @@ enum app_led_code {
 	APP_LED_MOUSE_RX,	/* 4 short blinks: mouse packet received */
 	APP_LED_ABS_RX,		/* 5 short blinks: absolute pointer packet received */
 	APP_LED_MACRO_PLAY,	/* 6 short blinks: macro playback started */
+	/* Connect-stage trace (v5.3): 200 ms pulses, see DEBUG_NOTES.md. */
+	APP_LED_CONN_REJECT,	/* 7: unbonded peer rejected (pairing window closed) */
+	APP_LED_SEC_FAIL,	/* 8: security/pairing failed */
+	APP_LED_TX_SUB,		/* 9: central subscribed to NUS TX */
+	APP_LED_NAME_READ,	/* 10: config (device name) characteristic read */
 };
 
 void app_led_debug(enum app_led_code code);

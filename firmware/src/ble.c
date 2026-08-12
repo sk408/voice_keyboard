@@ -78,6 +78,7 @@ static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 
 	tx_notif_enabled = (value == BT_GATT_CCC_NOTIFY);
 	if (tx_notif_enabled) {
+		app_led_debug(APP_LED_TX_SUB);
 		/* Send an initial idle status: a central that waits for a
 		 * status byte before its first RX write would otherwise
 		 * block forever (statuses were only sent after writes).
@@ -127,6 +128,7 @@ static ssize_t config_read(struct bt_conn *conn,
 			   const struct bt_gatt_attr *attr,
 			   void *buf, uint16_t len, uint16_t offset)
 {
+	app_led_debug(APP_LED_NAME_READ);
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
 				 device_name, device_name_len);
 }
@@ -312,6 +314,13 @@ static bool peer_is_bonded(struct bt_conn *conn)
 	return search.found;
 }
 
+static void bond_count_cb(const struct bt_bond_info *info, void *user_data)
+{
+	ARG_UNUSED(info);
+
+	(*(int *)user_data)++;
+}
+
 /* --- Pairing window --- */
 
 static void close_pairing_window(struct k_work *work);
@@ -363,6 +372,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	/* Outside the pairing window only bonded centrals may stay. */
 	if (!pairing_window_open && !peer_is_bonded(conn)) {
 		LOG_WRN("Rejecting unbonded peer (pairing window closed)");
+		app_led_debug(APP_LED_CONN_REJECT);
 		bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 		return;
 	}
@@ -394,6 +404,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 {
 	if (err) {
 		LOG_ERR("Security failed: level %u err %d", level, err);
+		app_led_debug(APP_LED_SEC_FAIL);
 	} else {
 		LOG_INF("Security changed: level %u", level);
 	}
@@ -533,6 +544,21 @@ int ble_init(void)
 
 	/* Bondable only inside the pairing window. */
 	bt_set_bondable(false);
+
+	/* A dongle with zero stored bonds can never be connected to: every
+	 * peer is rejected by the bonded-peers gate in connected() until the
+	 * physical button is pressed. That is the factory/repaired state
+	 * (fresh flash, v5 partition move, v5.2 repair-erase) — open the
+	 * pairing window once at boot so recovery never depends on button
+	 * access. With at least one bond the window stays button-gated.
+	 */
+	int bond_count = 0;
+
+	bt_foreach_bond(BT_ID_DEFAULT, bond_count_cb, &bond_count);
+	if (bond_count == 0) {
+		LOG_INF("No bonds stored: opening pairing window for recovery");
+		ble_open_pairing_window();
+	}
 
 	start_advertising();
 	app_boot_stage(5);
