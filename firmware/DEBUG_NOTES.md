@@ -356,6 +356,52 @@ Fix (this commit):
 Healthy v5.3 connect: green solid, then 9 blinks, then 10 blinks (web app
 reads the name right after subscribing), then usable.
 
+## v5.4: hang right after TX subscribe — notify from the BT RX thread
+
+Hardware observation on v5.3: the bondless-recovery fix worked — the phone
+connects, pairs and subscribes (9 blinks = `APP_LED_TX_SUB`, green solid) —
+but then the dongle hangs: the 10th blink (config read) never fires, no
+further GATT is answered, and there is no 1 s slow red blink, so it is a
+hang, not a fault.
+
+Root cause, statically proven against the Zephyr 4.1.0 tree:
+
+- `nus_tx_ccc_changed()` (TX CCC write callback) runs on the **BT RX
+  thread** and called `ble_notify_status(0x00)` synchronously (ble.c:86).
+- `bt_gatt_notify()` → `gatt_notify()` (gatt.c:2494) → `bt_att_create_pdu()`
+  → `bt_att_chan_create_pdu()` (att.c:713): for a notification the
+  allocation timeout is **K_FOREVER** unless the caller is the system
+  workqueue or the ATT-response thread (att.c:733-742), then
+  `bt_l2cap_create_pdu_timeout(&att_pool, 0, K_FOREVER)` (att.c:747).
+- `att_pool` has **3 buffers** (`CONFIG_BT_ATT_TX_COUNT=3`), shared with the
+  ATT responses of Android's MTU exchange + service discovery, which drain
+  slowly at `BT_CTLR_DATA_LENGTH_MAX=27`. The buffers are freed by HCI/ATT
+  TX-completion processing — which runs on the **same BT RX thread**. att.c
+  documents exactly this deadlock class (att.c:170-180: queuing an ATT
+  request from a callback blocks until a resource is available, and the
+  callbacks run on the same thread that frees the resources).
+- So when the pool is exhausted at subscribe time, the RX thread blocks
+  forever inside `bt_gatt_notify()`: the ATT server dies with the phone
+  still connected — 9 blinks, solid green, no 10th blink, no fault.
+
+The same hazard existed at every other notify call site reached from the RX
+thread: `ble_notify_status(VKB_TX_ERR_STORE_FULL)` and
+`ble_notify_macro_list()` from `macro_write()` (MACRO_RW write handler).
+
+Fix (this commit): **all notifications are deferred to the system
+workqueue** (`K_WORK`), where `bt_att_chan_create_pdu()` uses K_NO_WAIT by
+construction — the worst case is a dropped best-effort status byte, never a
+blocked thread. `ble_notify_status()` coalesces to the latest pending byte
+(last-write-wins; the initial idle `0x00` is re-queued on every subscribe);
+`ble_notify_macro_list()` lost its json/len parameters and rebuilds the
+list JSON at send time, so the notification always carries the latest store
+state. The web app does not gate its first write on the initial status
+(ble.ts send queue is independent of the status listener), so a dropped
+status under transient pool pressure is harmless.
+
+No LED code changes (the v5.3 connect-stage trace is unchanged). DIS
+firmware revision is `vk-5.4`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

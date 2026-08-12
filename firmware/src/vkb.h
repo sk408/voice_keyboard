@@ -49,7 +49,8 @@ int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y);
 
 /* --- BLE NUS peripheral (ble.c) --- */
 int ble_init(void);
-/* TX status notify (PROTOCOL.md: 0x00 idle, 0x01 busy), best effort. */
+/* TX status notify (PROTOCOL.md: 0x00 idle, 0x01 busy), best effort.
+ * Deferred to the system workqueue: safe to call from any context. */
 void ble_notify_status(uint8_t status);
 /* TX error codes (0xE0+), sent on the same NUS TX characteristic. */
 #define VKB_TX_ERR_STORE_FULL	0xE1	/* macro store budget exhausted */
@@ -57,8 +58,9 @@ void ble_notify_status(uint8_t status);
 void ble_open_pairing_window(void);
 /* True while a BLE connection is active (gates the macro trigger). */
 bool ble_is_connected(void);
-/* Notify MACRO_LIST subscribers that the store changed (macro.c). */
-void ble_notify_macro_list(const uint8_t *json, uint16_t len);
+/* Notify MACRO_LIST subscribers that the store changed (macro.c). Deferred
+ * to the system workqueue; the JSON is rebuilt at send time. */
+void ble_notify_macro_list(void);
 
 /* --- Macro store (macro.c), see README.md v5 section --- */
 /* MACRO_LIST read value: JSON array, e.g. [{"i":0,"name":"x","len":412}]. */

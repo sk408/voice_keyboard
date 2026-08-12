@@ -215,13 +215,12 @@ const uint8_t *macro_list_json(uint16_t *len)
 	return (const uint8_t *)list_json;
 }
 
-/* Notify subscribed centrals that the store changed. Caller holds no lock. */
+/* Queue a store-changed notification for subscribed centrals. Caller holds
+ * no lock; the JSON is rebuilt in ble.c when the deferred notify runs.
+ */
 static void notify_list_changed(void)
 {
-	uint16_t len;
-	const uint8_t *json = macro_list_json(&len);
-
-	ble_notify_macro_list(json, len);
+	ble_notify_macro_list();
 }
 
 /* --- minimal JSON object walker -------------------------------------------

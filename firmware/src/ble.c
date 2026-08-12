@@ -79,7 +79,7 @@ static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	tx_notif_enabled = (value == BT_GATT_CCC_NOTIFY);
 	if (tx_notif_enabled) {
 		app_led_debug(APP_LED_TX_SUB);
-		/* Send an initial idle status: a central that waits for a
+		/* Queue an initial idle status: a central that waits for a
 		 * status byte before its first RX write would otherwise
 		 * block forever (statuses were only sent after writes).
 		 */
@@ -427,25 +427,65 @@ static struct bt_conn_auth_cb auth_cb = {
 	.cancel = auth_cancel,
 };
 
-void ble_notify_status(uint8_t status)
+/* --- Notifications ---------------------------------------------------------
+ *
+ * bt_gatt_notify() must never run on the BT RX thread (GATT write/CCC
+ * callbacks included): for a notification it allocates a PDU from att_pool
+ * (CONFIG_BT_ATT_TX_COUNT=3 here) with K_FOREVER unless the caller is the
+ * system workqueue (Zephyr 4.1 att.c bt_att_chan_create_pdu()), and those
+ * buffers are freed by ATT TX completion processing on that same RX thread.
+ * A notify from inside a callback can therefore block the RX thread forever
+ * and kill the whole ATT server — the v5.3 hang right after TX subscribe
+ * (9 blinks, solid green, config read never answered). All notifications
+ * are deferred to the system workqueue, where the allocation is K_NO_WAIT
+ * and the worst case is a dropped (best-effort) byte.
+ *
+ * nus_svc attribute layout:
+ *   attrs[0] primary service, attrs[1] TX declaration,
+ *   attrs[2] TX value, attrs[3] TX CCC,
+ *   attrs[4] RX declaration, attrs[5] RX value,
+ *   attrs[6] config declaration, attrs[7] config value (v3),
+ *   attrs[8] MACRO_LIST declaration, attrs[9] MACRO_LIST value,
+ *   attrs[10] MACRO_LIST CCC (v5),
+ *   attrs[11] MACRO_RW declaration, attrs[12] MACRO_RW value (v5).
+ * Notifications must be sent on the VALUE attribute (attrs[2]); using
+ * attrs[1] notifies the declaration handle, which no central subscribes to,
+ * so every status byte is silently dropped.
+ */
+
+static uint8_t pending_status;
+static bool status_pending;
+
+static void status_notify_work_fn(struct k_work *work);
+
+static K_WORK_DEFINE(status_notify_work, status_notify_work_fn);
+
+static void status_notify_work_fn(struct k_work *work)
 {
-	if (!current_conn || !tx_notif_enabled) {
+	ARG_UNUSED(work);
+
+	if (!status_pending || !current_conn || !tx_notif_enabled) {
 		return;
 	}
 
-	/* nus_svc attribute layout:
-	 *   attrs[0] primary service, attrs[1] TX declaration,
-	 *   attrs[2] TX value, attrs[3] TX CCC,
-	 *   attrs[4] RX declaration, attrs[5] RX value,
-	 *   attrs[6] config declaration, attrs[7] config value (v3),
-	 *   attrs[8] MACRO_LIST declaration, attrs[9] MACRO_LIST value,
-	 *   attrs[10] MACRO_LIST CCC (v5),
-	 *   attrs[11] MACRO_RW declaration, attrs[12] MACRO_RW value (v5).
-	 * Notifications must be sent on the VALUE attribute (attrs[2]);
-	 * using attrs[1] notifies the declaration handle, which no central
-	 * subscribes to, so every status byte is silently dropped.
-	 */
-	bt_gatt_notify(current_conn, &nus_svc.attrs[2], &status, sizeof(status));
+	uint8_t status = pending_status;
+
+	status_pending = false;
+
+	int err = bt_gatt_notify(current_conn, &nus_svc.attrs[2],
+				 &status, sizeof(status));
+
+	if (err) {
+		LOG_WRN("Status notify failed (%d)", err);
+	}
+}
+
+/* Queues the status; the actual notify runs on the system workqueue. */
+void ble_notify_status(uint8_t status)
+{
+	pending_status = status;
+	status_pending = true;
+	k_work_submit(&status_notify_work);
 }
 
 bool ble_is_connected(void)
@@ -453,11 +493,23 @@ bool ble_is_connected(void)
 	return current_conn != NULL;
 }
 
-void ble_notify_macro_list(const uint8_t *json, uint16_t len)
+static void macro_list_notify_work_fn(struct k_work *work);
+
+static K_WORK_DEFINE(macro_list_notify_work, macro_list_notify_work_fn);
+
+static void macro_list_notify_work_fn(struct k_work *work)
 {
+	ARG_UNUSED(work);
+
 	if (!current_conn) {
 		return;
 	}
+
+	/* The list is rebuilt at send time, so the notification always
+	 * reflects the latest store state no matter when the work runs.
+	 */
+	uint16_t len;
+	const uint8_t *json = macro_list_json(&len);
 
 	/* MACRO_LIST value attribute (see layout above). NULL conn notifies
 	 * every peer that enabled the CCC. If the list outgrows the ATT MTU
@@ -469,6 +521,12 @@ void ble_notify_macro_list(const uint8_t *json, uint16_t len)
 	if (err) {
 		LOG_WRN("MACRO_LIST notify failed (%d)", err);
 	}
+}
+
+/* Queues the notification; the actual notify runs on the system workqueue. */
+void ble_notify_macro_list(void)
+{
+	k_work_submit(&macro_list_notify_work);
 }
 
 /* Erase the whole settings storage partition. Used to recover from a
