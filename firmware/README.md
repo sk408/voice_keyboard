@@ -34,9 +34,9 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
 **v5 flash-layout change**: the settings storage partition moved from the
 stock 16 KB at `0xDC000` to 32 KB at `0xB4000` (tail of the unused slot1
 partition; the app is capped below it via `CONFIG_FLASH_LOAD_SIZE`) to make
-room for the macro store next to bonds and the device name. Side effect of
-flashing v5 over ≤v4: bonds and the custom name stored in the old partition
-are not migrated — re-pair and re-set the name once.
+room for the macro store next to the bonds. Side effect of
+flashing v5 over ≤v4: bonds stored in the old partition
+are not migrated — re-pair once.
 
 ## Behavior
 
@@ -50,19 +50,13 @@ are not migrated — re-pair and re-set the name once.
   acceleration. Because the descriptor uses report
   IDs, the interface claims **no boot protocol** (`protocol-code = "none"`)
   — the keyboard does not work in BIOS/UEFI/pre-boot environments.
-- **BLE**: advertises as `VoiceKB` (default; user-settable, see below) with
+- **BLE**: advertises as `VoiceKB` (fixed compiled-in name; the v3
+  user-settable name was removed in v5.5, see DEBUG_NOTES.md) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-5.0`.
-- **Config characteristic (v3)**: `5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B`
-  (read / write-with-response, encrypted link required) on the same service.
-  Write a UTF-8 device name (1–20 printable ASCII chars) to rename the
-  dongle: it is persisted via the settings subsystem and applied to the GAP
-  Device Name immediately and to the advertising data on the next advertise
-  (after disconnect). Read returns the current name. Invalid names are
-  rejected (`Value Not Allowed`).
+  bytes). DIS firmware revision string: `vk-5.5`.
 - **Macro store characteristics (v5)**: two more vendor characteristics on
-  the same service, same vendor UUID base, both encrypted-link only:
+  the same service, both encrypted-link only:
   - MACRO_LIST `5A1B0002-8C4D-4E2F-9A3B-7C6D5E4F3A2B` (read + notify):
     JSON array of the stored macros, e.g.
     `[{"i":0,"name":"SOAP note","len":412}]` (`[]` when empty). A notify is
@@ -182,7 +176,7 @@ firmware/
 └── src/
     ├── main.c      # init, LED state machine, pairing button (debounced)
     ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse+abs pointer
-    ├── ble.c       # NUS-compatible GATT service, config char (v3), adv, bonding window, gating
+    ├── ble.c       # NUS-compatible GATT service, macro chars (v5), adv, bonding window, gating
     ├── typing.c    # RX byte stream -> HID reports, US keymap, v2/v4 escapes
     └── vkb.h       # internal interfaces
 ```

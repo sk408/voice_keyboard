@@ -350,11 +350,12 @@ Fix (this commit):
 | 7 blinks | connect reached `connected()` but the peer was **rejected** — no bond and pairing window closed (the bondless case above) |
 | 8 blinks | security/pairing failed (`security_changed` error — e.g. stale phone bond) |
 | 9 blinks | central subscribed to NUS TX (service discovery + subscribe succeeded) |
-| 10 blinks | config (device name) characteristic read — convicts or exonerates the v3 name feature on hardware |
+| 10 blinks | **first encrypted read completed** — since v5.5 emitted from the MACRO_LIST read handler (the config characteristic it used to mark is gone) |
 | repeating slow blink (1 s) | hard fault (unchanged, v5.2) |
 
-Healthy v5.3 connect: green solid, then 9 blinks, then 10 blinks (web app
-reads the name right after subscribing), then usable.
+Healthy connect (v5.5): green solid, then 9 blinks (TX subscribed), then
+10 blinks when the web app reads MACRO_LIST during the connect-time macro
+sync, then usable.
 
 ## v5.4: hang right after TX subscribe — notify from the BT RX thread
 
@@ -401,6 +402,54 @@ status under transient pool pressure is harmless.
 
 No LED code changes (the v5.3 connect-stage trace is unchanged). DIS
 firmware revision is `vk-5.4`.
+
+## v5.5: hang persists — the v3 config characteristic is removed outright
+
+Hardware observation on v5.3 **and** v5.4 (identical on both): TX subscribed
+(9 blinks), green LED solid, then **no 10th blink** — the config/name read
+never completes, no further GATT response, web app dead. The v5.4
+workqueue-notify fix did not change this, so the CCC-callback notify theory
+is falsified as the cause of *this* hang (the fix stays — it removed a real,
+statically proven K_FOREVER att_pool deadlock class; do not regress it).
+
+The 10th blink was emitted inside `config_read`, so the config
+characteristic path is the exact stalling operation, and the configurable
+device-name feature (v3) is the only feature separating v2 (last known-good
+on hardware) from the hanging builds. With the feature now implicated by
+direct evidence, it is **removed outright** (stability over the feature):
+
+- Config characteristic (`5A1B0001-…`) deleted from the GATT table, along
+  with `config_read`/`config_write`, `device_name_valid`,
+  `apply_device_name`, the `device_name`/`device_name_len` globals, the
+  `vkb_settings_set` handler + `SETTINGS_STATIC_HANDLER_DEFINE(vkb, …)` and
+  the `settings_save_one("vkb/name", …)` call.
+- Dynamic GAP-name machinery gone: no `bt_set_name()`, no
+  `CONFIG_BT_DEVICE_NAME_DYNAMIC` (removed from prj.conf), advertising data
+  carries the fixed compiled-in name `VoiceKB` statically. Boot no longer
+  touches settings for the name.
+- Everything else is unchanged: v5.4 workqueue notifications (K_WORK,
+  K_NO_WAIT allocation semantics), bondless recovery + 60 s self-opened
+  pairing window, the v5 macro store (MACRO_LIST/MACRO_RW, flash store,
+  standalone button trigger, MACRO_LIST notify), and the v2 core (composite
+  HID kbd+mouse, sticky modifiers, trackpad).
+- GATT attribute layout shifted down by two: MACRO_LIST value is now
+  `attrs[7]` (was `attrs[9]`); `ble_notify_macro_list()` updated. The TX
+  status notify target (`attrs[2]`) is unaffected.
+- The 10th connect-stage blink is **repurposed**: `APP_LED_NAME_READ` moved
+  to the MACRO_LIST read handler, so 10 blinks now means "first encrypted
+  GATT read completed" and the next hardware test still pinpoints a stall.
+
+### LED map (connect-stage trace, v5.5)
+
+| Pattern | Meaning |
+|---|---|
+| 9 blinks (200 ms) | central subscribed to NUS TX |
+| 10 blinks (200 ms) | first encrypted read done (MACRO_LIST read handler) |
+
+Web side needs no change: the app's `getCharacteristic(CONFIG_CHAR_UUID)`
+failure is caught (`config = null`, `supportsDeviceName` false, rename UI
+hidden, `refreshDeviceName` no-ops) — verified in `web/src/ble.ts` and
+`web/src/store.ts`. DIS firmware revision is `vk-5.5`.
 
 ## Not verified here
 

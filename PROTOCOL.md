@@ -5,7 +5,8 @@ and any central client (web app now; native Android/iOS apps later).
 
 ## Identity
 
-- Advertising name: `VoiceKB` by default; user-settable via the config characteristic (v3).
+- Advertising name: `VoiceKB` (fixed, compiled in; the v3 user-settable name
+  feature was removed in v5.5).
 - Transport: BLE only. USB side is a standard HID keyboard (boot protocol), no vendor interface.
 - Security: **LE bonding required** (Just Works). All writes require an encrypted link.
   Pairing window: bondable for 60s after a single press of the dongle button;
@@ -22,28 +23,16 @@ Standard NUS UUIDs so generic BLE UART libraries/apps work out of the box:
 | RX (central→dongle) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write-no-resp | keystroke payload |
 | TX (dongle→central) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | status bytes |
 
-Also standard DIS (0x180A) with Firmware Revision String = `vk-5.0`.
+Also standard DIS (0x180A) with Firmware Revision String = `vk-5.5`.
 
-## GATT — config characteristic (v3)
+## GATT — config characteristic (v3, REMOVED in v5.5)
 
-One vendor characteristic on the same (NUS-UUID) service:
-
-| Role | UUID | Properties | Notes |
-|---|---|---|---|
-| Config | `5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B` | read, write-with-response | device name |
-
-- Write payload: UTF-8 device name, **1–20 chars, printable ASCII (0x20–0x7E)
-  only**; anything else is rejected (`Value Not Allowed`). No NUL terminator.
-- The name is persisted in flash (settings subsystem) and applied as both the
-  GAP Device Name and the complete name in the advertising data. If written
-  while connected (the normal case), the new name appears on the next
-  advertising start (i.e. after disconnect); the GAP Device Name
-  characteristic updates immediately. Default name: `VoiceKB`.
-- Read returns the current name (no NUL terminator).
-- Like RX, both read and write require the encrypted/bonded link.
-- In v3/v4, macros were purely an app-side composition feature (compiled to
-  the ordinary RX byte stream). Since v5 they can also live on the dongle —
-  see the v5 section below.
+The v3 config characteristic (`5A1B0001-8C4D-4E2F-9A3B-7C6D5E4F3A2B`,
+user-settable device name) no longer exists: v5.5 removed it after it was
+implicated in a hardware hang at the config read (see firmware
+DEBUG_NOTES.md v5.5). The device name is the fixed compiled-in `VoiceKB`.
+Clients must tolerate its absence (the web app already does: the
+`getCharacteristic` lookup fails, the rename UI hides itself).
 
 ## RX payload (typing)
 
@@ -58,11 +47,12 @@ Stream of bytes, any chunking; dongle types as received, rate-limited (~15 ms/ke
 
 ## RX payload — v5 extensions (dongle-stored macros)
 
-The dongle is the source of truth for user macros (flash-persisted, like bonds/name).
+The dongle is the source of truth for user macros (flash-persisted, like bonds).
 Any client connects and reads the same library.
 
-- **Macro store characteristics** on the same (NUS-UUID) service, same vendor
-  UUID base as the config characteristic, both encrypted-link only:
+- **Macro store characteristics** on the same (NUS-UUID) service, vendor
+  UUID base `5A1Bxxxx-…` (shared with the removed v3 config char), both
+  encrypted-link only:
 
 | Role | UUID | Properties | Notes |
 |---|---|---|---|
@@ -118,9 +108,9 @@ Any client connects and reads the same library.
 
 ## Client UX requirements (any platform)
 
-1. Scan/filter by NUS service UUID; name prefix `VoiceKB` as fallback. If the
-   user has set a custom name via the config characteristic, match that stored
-   name first, then the `VoiceKB` fallback.
+1. Scan/filter by NUS service UUID; name prefix `VoiceKB` as fallback. The
+   name is fixed (`VoiceKB`) since v5.5 — there is no custom-name matching
+   anymore.
 2. Bond on first connect (Just Works pairing window after dongle button press).
 3. Persist the bond; reconnects must not require the pairing window.
 4. Live-typing mode should send each character/backspace as produced.

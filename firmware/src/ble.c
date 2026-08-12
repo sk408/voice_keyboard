@@ -2,10 +2,12 @@
  *
  * NUS-compatible GATT service (standard Nordic UART UUIDs) with encrypted
  * RX writes, LE bonding with a 60 s pairing window after a button press,
- * and bond persistence via the settings subsystem. v3 adds a config
- * characteristic (custom 128-bit UUID) for a user-settable, settings-
- * persisted device name. v5 adds the MACRO_LIST/MACRO_RW characteristics
- * (dongle-stored macros, see macro.c). See PROTOCOL.md.
+ * and bond persistence via the settings subsystem. v5 adds the
+ * MACRO_LIST/MACRO_RW characteristics (dongle-stored macros, see macro.c).
+ * v5.5 removed the v3 config characteristic (user-settable device name):
+ * it was implicated in a hardware hang at the config read (see
+ * DEBUG_NOTES.md v5.5); the device name is the fixed compiled-in
+ * CONFIG_BT_DEVICE_NAME. See PROTOCOL.md.
  */
 
 #include <zephyr/kernel.h>
@@ -40,25 +42,20 @@ extern int settings_subsys_init(void);
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x6e400002, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e))
 #define VKB_UUID_NUS_TX \
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x6e400003, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e))
-/* v3 config characteristic: user-settable device name (see PROTOCOL.md). */
-#define VKB_UUID_CONFIG \
-	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0001, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
-/* v5 macro store characteristics (same vendor base as the config char). */
+/* v5 macro store characteristics (vendor base formerly shared with the
+ * v3 config characteristic, removed in v5.5).
+ */
 #define VKB_UUID_MACRO_LIST \
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0002, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
 #define VKB_UUID_MACRO_RW \
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0003, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
 
-#define DEVICE_NAME_MAX		20	/* protocol limit: 1..20 printable ASCII */
+/* Fixed advertising/GAP name (compiled in; no longer user-settable). */
 #define DEVICE_NAME_DEFAULT	"VoiceKB"
 
 static struct bt_conn *current_conn;
 static bool tx_notif_enabled;
 static bool pairing_window_open;
-
-/* Current advertising/GAP name; NUL-terminated, length device_name_len. */
-static char device_name[DEVICE_NAME_MAX + 1] = DEVICE_NAME_DEFAULT;
-static uint8_t device_name_len = sizeof(DEVICE_NAME_DEFAULT) - 1;
 
 static ssize_t nus_rx_write(struct bt_conn *conn,
 			    const struct bt_gatt_attr *attr,
@@ -87,114 +84,18 @@ static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	}
 }
 
-/* --- v3 config characteristic: user-settable device name --- */
-
-static bool device_name_valid(const uint8_t *buf, uint16_t len)
-{
-	if (len < 1 || len > DEVICE_NAME_MAX) {
-		return false;
-	}
-	for (uint16_t i = 0; i < len; i++) {
-		if (buf[i] < 0x20 || buf[i] > 0x7e) { /* printable ASCII only */
-			return false;
-		}
-	}
-	return true;
-}
-
-static void start_advertising(void);
-
-/* Apply device_name to the GAP name and, when not connected, to the
- * advertising data immediately. While connected (the normal case for a
- * config write) advertising is stopped anyway; the new name is picked up
- * by the re-advertise on disconnect.
- */
-static void apply_device_name(void)
-{
-	if (IS_ENABLED(CONFIG_BT_DEVICE_NAME_DYNAMIC)) {
-		int err = bt_set_name(device_name);
-
-		if (err) {
-			LOG_WRN("bt_set_name failed (%d)", err);
-		}
-	}
-	if (!current_conn) {
-		bt_le_adv_stop();
-		start_advertising();
-	}
-}
-
-static ssize_t config_read(struct bt_conn *conn,
-			   const struct bt_gatt_attr *attr,
-			   void *buf, uint16_t len, uint16_t offset)
-{
-	app_led_debug(APP_LED_NAME_READ);
-	return bt_gatt_attr_read(conn, attr, buf, len, offset,
-				 device_name, device_name_len);
-}
-
-static ssize_t config_write(struct bt_conn *conn,
-			    const struct bt_gatt_attr *attr,
-			    const void *buf, uint16_t len,
-			    uint16_t offset, uint8_t flags)
-{
-	ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(flags);
-
-	if (offset != 0) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
-	if (!device_name_valid(buf, len)) {
-		LOG_WRN("Rejected invalid device name (len %u)", len);
-		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-	}
-
-	memcpy(device_name, buf, len);
-	device_name[len] = '\0';
-	device_name_len = len;
-	LOG_INF("Device name set to \"%s\"", device_name);
-
-	int err = settings_save_one("vkb/name", device_name, device_name_len);
-
-	if (err) {
-		LOG_ERR("Failed to persist device name (%d)", err);
-	}
-	apply_device_name();
-	return len;
-}
-
-/* Settings handler: restores the persisted name ("vkb/name") at boot. */
-static int vkb_settings_set(const char *key, size_t len,
-			    settings_read_cb read_cb, void *cb_arg)
-{
-	if (strcmp(key, "name") != 0) {
-		return -ENOENT;
-	}
-	if (len > DEVICE_NAME_MAX) {
-		return -EINVAL;
-	}
-
-	uint8_t buf[DEVICE_NAME_MAX];
-	ssize_t n = read_cb(cb_arg, buf, len);
-
-	if (n < 0 || !device_name_valid(buf, n)) {
-		LOG_WRN("Ignoring invalid persisted device name");
-		return 0;
-	}
-	memcpy(device_name, buf, n);
-	device_name[n] = '\0';
-	device_name_len = n;
-	LOG_INF("Restored device name \"%s\"", device_name);
-	return 0;
-}
-
-SETTINGS_STATIC_HANDLER_DEFINE(vkb, "vkb", NULL, vkb_settings_set, NULL, NULL);
-
 /* --- v5 macro store characteristics (logic lives in macro.c) --- */
 
 static ssize_t macro_list_read(struct bt_conn *conn,
 			       const struct bt_gatt_attr *attr,
 			       void *buf, uint16_t len, uint16_t offset)
 {
+	/* v5.5: 10th connect-stage blink — the first encrypted GATT read
+	 * completed (this handler takes over the role of the removed v3
+	 * config read in the connect trace).
+	 */
+	app_led_debug(APP_LED_NAME_READ);
+
 	uint16_t json_len;
 	const uint8_t *json = macro_list_json(&json_len);
 
@@ -239,10 +140,6 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 		BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
 		BT_GATT_PERM_WRITE_ENCRYPT,
 		NULL, nus_rx_write, NULL),
-	BT_GATT_CHARACTERISTIC(VKB_UUID_CONFIG,
-		BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
-		BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
-		config_read, config_write, NULL),
 	BT_GATT_CHARACTERISTIC(VKB_UUID_MACRO_LIST,
 		BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 		BT_GATT_PERM_READ_ENCRYPT,
@@ -254,15 +151,15 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 		macro_rw_read, macro_rw_write, NULL),
 );
 
-/* Advertising data is rebuilt from device_name on every (re)start, so a
- * name set via the config characteristic shows up in the next advertise.
+/* Advertising data carries the fixed compiled-in name (v5.5: the v3
+ * user-settable name feature and its dynamic rebuild are gone).
  */
 static struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
 	{
 		.type = BT_DATA_NAME_COMPLETE,
-		.data_len = 0, /* set from device_name_len in start_advertising() */
-		.data = (const uint8_t *)device_name,
+		.data_len = sizeof(DEVICE_NAME_DEFAULT) - 1,
+		.data = (const uint8_t *)DEVICE_NAME_DEFAULT,
 	},
 };
 
@@ -274,8 +171,6 @@ static const struct bt_data sd[] = {
 
 static void start_advertising(void)
 {
-	ad[1].data_len = device_name_len;
-
 	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad),
 				  sd, ARRAY_SIZE(sd));
 	if (err) {
@@ -440,14 +335,14 @@ static struct bt_conn_auth_cb auth_cb = {
  * are deferred to the system workqueue, where the allocation is K_NO_WAIT
  * and the worst case is a dropped (best-effort) byte.
  *
- * nus_svc attribute layout:
+ * nus_svc attribute layout (v5.5: the v3 config characteristic is gone,
+ * shifting the macro attributes down by two):
  *   attrs[0] primary service, attrs[1] TX declaration,
  *   attrs[2] TX value, attrs[3] TX CCC,
  *   attrs[4] RX declaration, attrs[5] RX value,
- *   attrs[6] config declaration, attrs[7] config value (v3),
- *   attrs[8] MACRO_LIST declaration, attrs[9] MACRO_LIST value,
- *   attrs[10] MACRO_LIST CCC (v5),
- *   attrs[11] MACRO_RW declaration, attrs[12] MACRO_RW value (v5).
+ *   attrs[6] MACRO_LIST declaration, attrs[7] MACRO_LIST value,
+ *   attrs[8] MACRO_LIST CCC (v5),
+ *   attrs[9] MACRO_RW declaration, attrs[10] MACRO_RW value (v5).
  * Notifications must be sent on the VALUE attribute (attrs[2]); using
  * attrs[1] notifies the declaration handle, which no central subscribes to,
  * so every status byte is silently dropped.
@@ -516,7 +411,7 @@ static void macro_list_notify_work_fn(struct k_work *work)
 	 * the notification is dropped (best effort); the list can always be
 	 * read back from the characteristic itself.
 	 */
-	int err = bt_gatt_notify(NULL, &nus_svc.attrs[9], json, len);
+	int err = bt_gatt_notify(NULL, &nus_svc.attrs[7], json, len);
 
 	if (err) {
 		LOG_WRN("MACRO_LIST notify failed (%d)", err);
@@ -558,7 +453,7 @@ int ble_init(void)
 	 * stage 2 with no BLE (observed on v5/v5.1 hardware). Mount it
 	 * ourselves first; on failure erase the partition and retry, so
 	 * the mount always sees a valid (empty) NVS. A repair erase loses
-	 * bonds/name: re-pair once.
+	 * bonds: re-pair once.
 	 */
 	app_boot_mark(1);
 	err = settings_subsys_init();
@@ -590,13 +485,6 @@ int ble_init(void)
 	/* Assemble settings-restored macro chunks (no-op when none). */
 	macro_boot_finalize();
 	app_boot_stage(4);
-
-	/* Reflect the (possibly settings-restored) name in the GAP Device
-	 * Name characteristic; advertising data picks it up below.
-	 */
-	if (IS_ENABLED(CONFIG_BT_DEVICE_NAME_DYNAMIC)) {
-		bt_set_name(device_name);
-	}
 
 	bt_conn_auth_cb_register(&auth_cb);
 

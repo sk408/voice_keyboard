@@ -24,7 +24,7 @@ enum app_led_code {
 	APP_LED_CONN_REJECT,	/* 7: unbonded peer rejected (pairing window closed) */
 	APP_LED_SEC_FAIL,	/* 8: security/pairing failed */
 	APP_LED_TX_SUB,		/* 9: central subscribed to NUS TX */
-	APP_LED_NAME_READ,	/* 10: config (device name) characteristic read */
+	APP_LED_NAME_READ,	/* 10: first encrypted read (MACRO_LIST) done */
 };
 
 void app_led_debug(enum app_led_code code);
