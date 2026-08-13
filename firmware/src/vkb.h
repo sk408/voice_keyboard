@@ -19,12 +19,12 @@ enum app_led_code {
 	APP_LED_HID_READY,	/* solid 1 s: host configured the HID interface */
 	APP_LED_MOUSE_RX,	/* 4 short blinks: mouse packet received */
 	APP_LED_ABS_RX,		/* 5 short blinks: absolute pointer packet received */
-	APP_LED_MACRO_PLAY,	/* 6 short blinks: macro playback started */
+	APP_LED_MACRO_PLAY,	/* 6 short blinks: macro playback started (v5 only; unused since v5.14) */
 	/* Connect-stage trace (v5.3): 200 ms pulses, see DEBUG_NOTES.md. */
 	APP_LED_CONN_REJECT,	/* 7: unbonded peer rejected (pairing window closed) */
 	APP_LED_SEC_FAIL,	/* 8: security/pairing failed */
 	APP_LED_TX_SUB,		/* 9: central subscribed to NUS TX */
-	APP_LED_NAME_READ,	/* 10: first encrypted read done (MACRO_LIST read) */
+	APP_LED_NAME_READ,	/* 10: first encrypted read done (v5.x only; no trigger since v5.14) */
 };
 
 void app_led_debug(enum app_led_code code);
@@ -52,41 +52,24 @@ int ble_init(void);
 /* TX status notify (PROTOCOL.md: 0x00 idle, 0x01 busy), best effort.
  * Deferred to the system workqueue: safe to call from any context. */
 void ble_notify_status(uint8_t status);
-/* TX error codes (0xE0+), sent on the same NUS TX characteristic. */
-#define VKB_TX_ERR_STORE_FULL	0xE1	/* macro store budget exhausted */
-#define VKB_TX_ERR_FLASH	0xE2	/* deferred macro flash persistence failed */
 /* Open the 60 s bonding window (called on dongle button press). */
 void ble_open_pairing_window(void);
-/* True while a BLE connection is active (gates the macro trigger). */
+/* True while a BLE connection is active. */
 bool ble_is_connected(void);
-/* Notify MACRO_LIST subscribers that the store changed (macro.c). Deferred
- * to the system workqueue; the JSON is rebuilt at send time. */
-void ble_notify_macro_list(void);
-
-/* --- Macro store (macro.c), see PROTOCOL.md v5 section --- */
-/* Worst-case MACRO_LIST JSON size (16 slots, each name byte escaped as
- * \u00XX). Callers pass a buffer this large to macro_list_json().
+/* v5.14: the dongle-stored macro store (macro.c) is out of the build for
+ * good — its GATT surface hung every v5.x/v5.12/v5.13 build on hardware.
+ * The macro_*() and ble_notify_macro_list() declarations, the macro JSON
+ * buffer constants, and VKB_TX_ERR_STORE_FULL/VKB_TX_ERR_FLASH were
+ * removed with it; see git history (v5.13, 1ce9ca0) and DEBUG_NOTES.md
+ * v5.14.
  */
-#define MACRO_LIST_JSON_MAX	(16 * (24 * 6 + 32) + 4)
-/* Rebuild the MACRO_LIST JSON value into caller-provided buf (>= size
- * MACRO_LIST_JSON_MAX); returns the length (excluding NUL). */
-uint16_t macro_list_json(char *buf, size_t buf_size);
-/* MACRO_RW write handler: returns 0, or a negative BT_ATT_ERR_* code. */
-int macro_write(const uint8_t *buf, uint16_t len);
-/* MACRO_RW read value: response prepared by the last "get" write. */
-const uint8_t *macro_get_response(uint16_t *len);
-/* Abort a put mid-transfer (e.g. on disconnect). */
-void macro_abort_put(void);
-/* Assemble settings-restored chunks into slots; call after settings_load(). */
-void macro_boot_finalize(void);
-/* Play a stored macro through the typing engine (async; no-op if empty). */
-void macro_play(uint8_t index);
 
 /* --- Typing engine (typing.c) --- */
 /* Feed received NUS RX bytes into the keystroke stream (any chunking). */
 void typing_feed(const void *data, uint16_t len);
 /* Feed bytes like typing_feed(), but block until all of them are queued
- * (macro playback; the ring drains at typing speed).
+ * (reserved for macro playback — unused since v5.14 removed the macro
+ * store; the ring drains at typing speed).
  */
 void typing_play(const void *data, uint16_t len);
 /* Drop all pending keystrokes (e.g. on disconnect). */

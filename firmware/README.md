@@ -33,9 +33,10 @@ below, bootloader at `0xF4000`) and does not touch the bootloader.
 
 **v5 flash-layout change**: the settings storage partition moved from the
 stock 16 KB at `0xDC000` to 32 KB at `0xB4000` (tail of the unused slot1
-partition; the app is capped below it via `CONFIG_FLASH_LOAD_SIZE`) to make
-room for the macro store next to the bonds. Side effect of
-flashing v5 over ≤v4: bonds stored in the old partition
+partition; the app is capped below it via `CONFIG_FLASH_LOAD_SIZE`),
+originally to make room for the macro store next to the bonds — the macro
+store is removed for good in v5.14, so the partition now holds only bonds.
+Side effect of flashing v5 over ≤v4: bonds stored in the old partition
 are not migrated — re-pair once.
 
 ## Behavior
@@ -54,15 +55,16 @@ are not migrated — re-pair once.
   user-settable name was removed in v5.5, see DEBUG_NOTES.md) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-5.13`.
-- **Macro store (v5, re-added in v5.12)**: the MACRO_LIST/MACRO_RW
-  characteristics, the flash-backed 16-slot/16 KB macro store
-  (`macro.c`), and the standalone long-press trigger. v5.6 stripped them
-  as a deliberate bisect back to the v2 core (see DEBUG_NOTES.md v5.6);
-  v5.12 re-added them once v5.7's forced encryption and v5.8's
-  numeric-comparison pairing made the encrypted GATT path work (see
-  DEBUG_NOTES.md v5.12). A long button press (>1.5 s, no BLE connection)
-  plays macro slot 0; short press remains the 60 s pairing window.
+  bytes). DIS firmware revision string: `vk-5.14`.
+- **Macro store (v5) — removed for good in v5.14**: the MACRO_LIST/MACRO_RW
+  characteristics, the flash-backed 16-slot/16 KB macro store (`macro.c`),
+  and the standalone long-press trigger hung on hardware across v5.x,
+  v5.12, and v5.13 (saving macros reported a chunked MACRO_RW get response
+  that ended early, then the dongle stopped responding), so they are
+  removed for good (see DEBUG_NOTES.md v5.14). `macro.c` stays in the tree
+  but is excluded from the build; the protocol documentation lives in git
+  history (v5.13, 1ce9ca0). A long button press now does nothing; short
+  press remains the 60 s pairing window.
 - **Typing**: RX bytes are reassembled as a byte stream (robust to any BLE
   chunking, including escape sequences split across chunk boundaries) and
   typed on a US layout at ~15 ms/keystroke. Shift handling for
@@ -90,7 +92,7 @@ are not migrated — re-pair once.
   Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
   report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
   interface ready, 4 = mouse packet received, 5 = absolute pointer packet
-  received (6 = macro playback started). At boot the red LED also runs a
+  received (6 = macro playback started, v5 only — unused since v5.14). At boot the red LED also runs a
   stage trace (1→5 blinks in slow groups: main, USB up, BLE up, settings
   loaded, advertising up) — the last group seen pinpoints a boot hang.
   Long (400 ms) blinks are boot sub-stages on the bt_enable() path, and
@@ -136,7 +138,7 @@ firmware/
 └── src/
     ├── main.c      # init, LED state machine, pairing button (debounced)
     ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse+abs pointer
-    ├── ble.c       # NUS-compatible GATT service, macro chars (v5), adv, bonding window, gating
+    ├── ble.c       # NUS-compatible GATT service, adv, bonding window, gating
     ├── typing.c    # RX byte stream -> HID reports, US keymap, v2/v4 escapes
     └── vkb.h       # internal interfaces
 ```

@@ -904,6 +904,58 @@ chunks beyond the new length are also dropped on the happy path.
 (+34.6 KB vs v5.12: the 16 KB ring, the 16 KB `persist_buf`, and the two
 per-path list-json buffers). UF2 at `build/zephyr/zephyr.uf2`.
 
+## v5.14: dongle-stored macros removed for good
+
+Hardware observation on v5.13: saving a macro reports a chunked MACRO_RW
+get response that ends early ("final get chunk ended at 2, announced total
+12"), then the red LED flashes and the dongle stops responding. This is
+the same ATT-stall hang class as every v5.x iteration, and it has now
+recurred across v5.x, v5.12, and v5.13 — three separate re-add attempts
+(initial v5, the v5.12 re-add after the v5.6 bisect, and the v5.13
+flash-off-the-RX-thread rework) all hung on hardware despite static
+audits that found no `store_lock` leak and despite v5.7/v5.8 fixing the
+encryption path. The macro GATT surface is **removed for good**; it is not
+a bisect this time.
+
+Removed:
+
+- MACRO_LIST characteristic (declaration, value, CCC) and `macro_list_read`.
+- MACRO_RW characteristic and `macro_rw_read` / `macro_rw_write`.
+- `ble_notify_macro_list()` + `macro_list_notify_work` in ble.c.
+- `macro.c` excluded from the build (CMakeLists); the file stays in the
+  tree as a reference (as v5.6 did). Its entry points are gone with it:
+  no `macro_boot_finalize()` after `settings_load()`, no `macro_abort_put()`
+  on disconnect, no button → `macro_play()` (a long press now just logs).
+- vkb.h macro declarations, `VKB_TX_ERR_STORE_FULL` (0xE1) /
+  `VKB_TX_ERR_FLASH` (0xE2), and `MACRO_LIST_JSON_MAX` removed.
+- The v5.13 review fixes that touched `macro.c` (#2 deferred flash
+  persistence, #5 caller-buffer list JSON, #7 name-first save, #8 full
+  chunk-range rollback) go away with the file.
+
+Kept (do not regress): v5.13's macro-independent fixes live in `typing.c`
+and remain — `RX_RING_SIZE` 16384 (review #1) and the `typing_reset()`
+race fix via the `reset_pending` flag (review #3). Also kept: v5.7 forced
+encryption (`bt_conn_set_security(conn, BT_SECURITY_L2)` on connect),
+v5.8 DisplayYesNo numeric-comparison pairing, v5.9 absolute-pointer
+descriptor (report ID 3 = Generic Desktop Pointer), v5.10/v5.11 touchpad
+behavior, v5.4 workqueue-deferred notifications, v5.3 bondless recovery,
+v5.2 NVS mount/repair, and the connect-stage LED trace + hard-fault blink.
+
+The nus_svc table shrinks back to 6 attributes (`attrs[0..5]`); the TX
+status notify target (`attrs[2]`) is unchanged. The v5 ATT MTU headroom
+(`ACL_RX/L2CAP_TX_MTU=200`, `BT_CTLR_DATA_LENGTH_MAX=27` pin) is kept so
+the on-air link stays byte-identical to the v5.x builds. The 10th
+connect-stage blink has no trigger anymore (it fired from the MACRO_LIST
+read handler); the enum/`main.c` case are retained, and the trace now ends
+at 9 blinks = TX subscribed.
+
+Web side needs no change (verified): `web/src/ble.ts` catches the absent
+MACRO_LIST/MACRO_RW `getCharacteristic()` calls (`macroList`/`macroRw` =
+null → `supportsMacroStore` false), `web/src/store.ts` falls back to
+localStorage macros, and `MacroPanel` keeps its Import/Export
+(`exportMacrosJson`/`parseMacrosImport`). DIS firmware revision is
+`vk-5.14`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

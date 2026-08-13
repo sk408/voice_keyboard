@@ -10,5 +10,8 @@ target_sources(app PRIVATE
   src/usb_kbd.c
   src/ble.c
   src/typing.c
-  src/macro.c
+  # v5.14: src/macro.c (dongle-stored macro store) excluded — the macro
+  # GATT surface hung every v5.x/v5.12/v5.13 build on hardware and is
+  # removed for good; the file stays in the tree as a reference
+  # (see DEBUG_NOTES.md v5.14).
 )
