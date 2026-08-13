@@ -23,7 +23,7 @@ Standard NUS UUIDs so generic BLE UART libraries/apps work out of the box:
 | RX (central→dongle) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write-no-resp | keystroke payload |
 | TX (dongle→central) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | status bytes |
 
-Also standard DIS (0x180A) with Firmware Revision String = `vk-5.11`.
+Also standard DIS (0x180A) with Firmware Revision String = `vk-5.12`.
 
 ## GATT — config characteristic (v3, REMOVED in v5.5)
 
@@ -45,15 +45,16 @@ Stream of bytes, any chunking; dongle types as received, rate-limited (~15 ms/ke
     `0x06` Delete, `0x07` Home, `0x08` End, `0x09` PageUp, `0x0A` PageDown,
     `0x10`–`0x1B` F1–F12
 
-## RX payload — v5 extensions (dongle-stored macros, REMOVED in v5.6)
+## RX payload — v5 extensions (dongle-stored macros)
 
-v5.6 stripped the macro store from the firmware: the MACRO_LIST/MACRO_RW
-characteristics never worked on hardware and caused every v5.x connect
-hang, so they were removed as a deliberate bisect back to the v2 core
-(see firmware DEBUG_NOTES.md v5.6). The spec below is kept as the
-reference for the planned incremental re-add. Clients must tolerate the
-absence of both characteristics (the web app already does: the
-`getCharacteristic` lookups fail, macros fall back to localStorage).
+The macro store was stripped in v5.6 as a deliberate bisect back to the
+v2 core (the characteristics never worked on hardware and caused every
+v5.x connect hang — see firmware DEBUG_NOTES.md v5.6), then re-added in
+v5.12 once v5.7's forced encryption and v5.8's numeric-comparison
+pairing made the encrypted GATT path work (see DEBUG_NOTES.md v5.12).
+Clients should tolerate the absence of both characteristics (the web app
+does: the `getCharacteristic` lookups fail, macros fall back to
+localStorage).
 
 The dongle is the source of truth for user macros (flash-persisted, like bonds).
 Any client connects and reads the same library.

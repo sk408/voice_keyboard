@@ -4,10 +4,10 @@
  * RX writes, LE bonding with a 60 s pairing window after a button press,
  * and bond persistence via the settings subsystem. The device name is the
  * fixed compiled-in CONFIG_BT_DEVICE_NAME (the v3 user-settable name was
- * removed in v5.5). v5.6 removed the v5 MACRO_LIST/MACRO_RW macro-store
- * characteristics: they never worked on hardware and caused every v5.x
- * connect hang (see DEBUG_NOTES.md v5.6); macro.c stays in the tree as a
- * reference but is excluded from the build. See PROTOCOL.md.
+ * removed in v5.5). v5.12 re-added the v5 MACRO_LIST/MACRO_RW macro-store
+ * characteristics (stripped in v5.6 as a bisect); the store is back now
+ * that v5.7 forces encryption on connect and v5.8 pairs with numeric
+ * comparison (see DEBUG_NOTES.md v5.12). See PROTOCOL.md.
  */
 
 #include <zephyr/kernel.h>
@@ -42,6 +42,14 @@ extern int settings_subsys_init(void);
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x6e400002, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e))
 #define VKB_UUID_NUS_TX \
 	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x6e400003, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e))
+
+/* v5 macro store characteristics (vendor base formerly shared with the
+ * v3 config characteristic, removed in v5.5).
+ */
+#define VKB_UUID_MACRO_LIST \
+	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0002, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
+#define VKB_UUID_MACRO_RW \
+	BT_UUID_DECLARE_128(BT_UUID_128_ENCODE(0x5a1b0003, 0x8c4d, 0x4e2f, 0x9a3b, 0x7c6d5e4f3a2b))
 /* Fixed advertising/GAP name (compiled in; no longer user-settable). */
 #define DEVICE_NAME_DEFAULT	"VoiceKB"
 
@@ -76,6 +84,50 @@ static void nus_tx_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	}
 }
 
+/* --- v5 macro store characteristics (logic lives in macro.c) --- */
+
+static ssize_t macro_list_read(struct bt_conn *conn,
+			       const struct bt_gatt_attr *attr,
+			       void *buf, uint16_t len, uint16_t offset)
+{
+	/* First encrypted GATT read (10th connect-stage blink): the
+	 * MACRO_LIST read takes over the role of the removed v3 config
+	 * read in the connect trace.
+	 */
+	app_led_debug(APP_LED_NAME_READ);
+
+	uint16_t json_len;
+	const uint8_t *json = macro_list_json(&json_len);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, json, json_len);
+}
+
+static ssize_t macro_rw_read(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset)
+{
+	uint16_t resp_len;
+	const uint8_t *resp = macro_get_response(&resp_len);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, resp, resp_len);
+}
+
+static ssize_t macro_rw_write(struct bt_conn *conn,
+			      const struct bt_gatt_attr *attr,
+			      const void *buf, uint16_t len,
+			      uint16_t offset, uint8_t flags)
+{
+	ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(flags);
+
+	if (offset != 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	int err = macro_write(buf, len);
+
+	return err ? BT_GATT_ERR(-err) : len;
+}
+
 BT_GATT_SERVICE_DEFINE(nus_svc,
 	BT_GATT_PRIMARY_SERVICE(VKB_UUID_NUS_SERVICE),
 	BT_GATT_CHARACTERISTIC(VKB_UUID_NUS_TX,
@@ -88,6 +140,15 @@ BT_GATT_SERVICE_DEFINE(nus_svc,
 		BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
 		BT_GATT_PERM_WRITE_ENCRYPT,
 		NULL, nus_rx_write, NULL),
+	BT_GATT_CHARACTERISTIC(VKB_UUID_MACRO_LIST,
+		BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+		BT_GATT_PERM_READ_ENCRYPT,
+		macro_list_read, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+	BT_GATT_CHARACTERISTIC(VKB_UUID_MACRO_RW,
+		BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+		BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT,
+		macro_rw_read, macro_rw_write, NULL),
 );
 
 /* Advertising data carries the fixed compiled-in name (v5.5: the v3
@@ -247,6 +308,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	tx_notif_enabled = false;
 	typing_reset();
+	macro_abort_put();
 	start_advertising();
 }
 
@@ -346,10 +408,13 @@ static struct bt_conn_auth_cb auth_cb = {
  * are deferred to the system workqueue, where the allocation is K_NO_WAIT
  * and the worst case is a dropped (best-effort) byte.
  *
- * nus_svc attribute layout (v5.6: the v5 macro characteristics are gone):
+ * nus_svc attribute layout (v5.12: macro characteristics restored):
  *   attrs[0] primary service, attrs[1] TX declaration,
  *   attrs[2] TX value, attrs[3] TX CCC,
- *   attrs[4] RX declaration, attrs[5] RX value.
+ *   attrs[4] RX declaration, attrs[5] RX value,
+ *   attrs[6] MACRO_LIST declaration, attrs[7] MACRO_LIST value,
+ *   attrs[8] MACRO_LIST CCC,
+ *   attrs[9] MACRO_RW declaration, attrs[10] MACRO_RW value.
  * Notifications must be sent on the VALUE attribute (attrs[2]); using
  * attrs[1] notifies the declaration handle, which no central subscribes to,
  * so every status byte is silently dropped.
@@ -393,6 +458,42 @@ void ble_notify_status(uint8_t status)
 bool ble_is_connected(void)
 {
 	return current_conn != NULL;
+}
+
+static void macro_list_notify_work_fn(struct k_work *work);
+
+static K_WORK_DEFINE(macro_list_notify_work, macro_list_notify_work_fn);
+
+static void macro_list_notify_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!current_conn) {
+		return;
+	}
+
+	/* The list is rebuilt at send time, so the notification always
+	 * reflects the latest store state no matter when the work runs.
+	 */
+	uint16_t len;
+	const uint8_t *json = macro_list_json(&len);
+
+	/* MACRO_LIST value attribute (see layout above). NULL conn notifies
+	 * every peer that enabled the CCC. If the list outgrows the ATT MTU
+	 * the notification is dropped (best effort); the list can always be
+	 * read back from the characteristic itself.
+	 */
+	int err = bt_gatt_notify(NULL, &nus_svc.attrs[7], json, len);
+
+	if (err) {
+		LOG_WRN("MACRO_LIST notify failed (%d)", err);
+	}
+}
+
+/* Queues the notification; the actual notify runs on the system workqueue. */
+void ble_notify_macro_list(void)
+{
+	k_work_submit(&macro_list_notify_work);
 }
 
 /* Erase the whole settings storage partition. Used to recover from a
@@ -453,6 +554,8 @@ int ble_init(void)
 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
 		settings_load();
 	}
+	/* Assemble settings-restored macro chunks (no-op when none). */
+	macro_boot_finalize();
 	app_boot_stage(4);
 
 	bt_conn_auth_cb_register(&auth_cb);

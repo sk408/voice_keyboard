@@ -726,6 +726,98 @@ formats, the firmware parser, and the report descriptor are untouched.
 Scroll and the relative mouse are unaffected. DIS firmware revision is
 `vk-5.11`.
 
+## v5.12: dongle-stored macros re-added (v5.6 bisect closed)
+
+The v5 macro store (MACRO_LIST + MACRO_RW, the flash-backed store in
+`macro.c`, and the standalone long-press button trigger) is re-added,
+reversing the v5.6 strip. The clean core proven on v5.7–v5.11 is left
+byte-identical except for the re-added surface: v5.7's
+`bt_conn_set_security(conn, BT_SECURITY_L2)` on connect, v5.8's
+DisplayYesNo numeric-comparison pairing, v5.4's workqueue-deferred
+notifications, v5.3's bondless recovery, and v5.2's NVS mount/repair are
+all untouched.
+
+### store_lock audit — hypothesis falsified (no leak)
+
+The v5.6 note hypothesized the v5.5 hang was a `store_lock` leak:
+`macro_list_read` → `macro_list_json()` → `k_mutex_lock(&store_lock,
+K_FOREVER)` on the BT RX thread, blocked forever because some path locked
+the mutex and never released it (prime suspect: `macro_boot_finalize()`).
+Every `k_mutex_lock(&store_lock, …)` in `macro.c` was audited:
+
+| Function | Lock taken | All paths release? |
+|---|---|---|
+| `macro_list_json()` | yes | yes — lock → rebuild → unlock |
+| `macro_abort_put()` | yes | yes — single path |
+| `handle_put()` | yes | yes — six exit paths, every one unlocks first |
+| `handle_del()` | yes | yes — both paths |
+| `handle_get()` | yes | yes — both paths |
+| `macro_play()` | yes | yes — single path |
+| `macro_play_thread()` | yes | yes — single path |
+| `macro_boot_finalize()` | **none taken** | n/a — runs once, single-threaded, before GATT is exposed |
+
+No early-return path skips `k_mutex_unlock()`, and
+`macro_boot_finalize()` does not take the lock at all (it assembles the
+settings-restored chunks on the init thread, before advertising starts).
+The leak hypothesis is therefore **not confirmed** by static audit.
+
+The more likely v5.5 root cause, in hindsight, is the same
+encryption-escalation gap v5.7 fixed for RX writes: MACRO_LIST is
+`BT_GATT_PERM_READ_ENCRYPT`, and v5.5 had nothing forcing the link to
+encrypt, so the first encrypted GATT read on an unencrypted link never
+completed. With v5.7's `bt_conn_set_security()` already in the tree (and
+v5.8's numeric-comparison pairing landing on L3/L4, which exceeds L2),
+the encrypted read now works with no change to the store itself.
+
+### Restored surface
+
+- `CMakeLists.txt`: `src/macro.c` back in the build (the file was kept in
+  the tree, byte-identical since v5.5).
+- `vkb.h`: macro declarations (`macro_list_json`, `macro_write`,
+  `macro_get_response`, `macro_abort_put`, `macro_boot_finalize`,
+  `macro_play`), `ble_notify_macro_list()`, and `VKB_TX_ERR_STORE_FULL`
+  (0xE1) restored.
+- `ble.c`: `VKB_UUID_MACRO_LIST` / `VKB_UUID_MACRO_RW`, the
+  `macro_list_read` / `macro_rw_read` / `macro_rw_write` handlers, and the
+  two characteristics re-added to `nus_svc`. `macro_list_read` re-emits
+  the 10th connect-stage blink (`APP_LED_NAME_READ` = first encrypted
+  read done). `macro_list_notify_work_fn` + `ble_notify_macro_list()` are
+  restored on the v5.4 pattern (system workqueue, K_NO_WAIT allocation);
+  `macro_abort_put()` is re-wired into `disconnected()`, and
+  `macro_boot_finalize()` runs right after `settings_load()` in
+  `ble_init()`.
+- `main.c`: the long-press (>1.5 s, no BLE connection) button handler
+  calls `macro_play(0)` again.
+- `nus_svc` layout is now 11 attributes: `attrs[6]` MACRO_LIST
+  declaration, `attrs[7]` value (notify target), `attrs[8]` CCC,
+  `attrs[9]` MACRO_RW declaration, `attrs[10]` value. TX status notify
+  stays on `attrs[2]`.
+
+### Encryption compatibility
+
+MACRO_LIST is `READ_ENCRYPT` (read + notify; CCC `READ_ENCRYPT |
+WRITE_ENCRYPT`); MACRO_RW is `READ_ENCRYPT | WRITE_ENCRYPT`. All are
+satisfied by `BT_SECURITY_L2`, which v5.7 requests on every accepted
+connection; v5.8's numeric-comparison pairing lands on L3/L4, exceeding
+it. No permission change was needed.
+
+### Web
+
+No web change is required beyond the version bump: `web/src/ble.ts` has
+always fetched MACRO_LIST/MACRO_RW and fallen back to localStorage when
+they are absent (`supportsMacroStore`), and `web/src/store.ts` runs
+`syncMacroStore` on connect whenever `conn.supportsMacroStore` is true.
+Once the characteristics return, the dongle store becomes the source of
+truth automatically. `web/package.json` bumped to `5.12.0`; DIS firmware
+revision is `vk-5.12`.
+
+### Not hardware-tested
+
+No dongle is attached to this machine. The store_lock audit is static;
+the encryption path is reconciled against the v5.7/v5.8 analysis rather
+than a live pairing. First hardware flash should confirm: 9 blinks (TX
+subscribed) → 10 blinks (MACRO_LIST read) → usable, with no ATT stall.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.
