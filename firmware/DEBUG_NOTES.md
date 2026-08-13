@@ -818,6 +818,92 @@ the encryption path is reconciled against the v5.7/v5.8 analysis rather
 than a live pairing. First hardware flash should confirm: 9 blinks (TX
 subscribed) → 10 blinks (MACRO_LIST read) → usable, with no ATT stall.
 
+## v5.13: firmware-only review fixes (flash off the BT RX thread, ring/typing races, list-json tear)
+
+A full code review (cross-referenced against Zephyr 4.1 host source and
+this file) produced 11 findings. This drop fixes the six that are
+firmware-only, safe, and high-value. No `web/` change — the web app is
+byte-for-byte and behavior-identical, and the on-air protocol is
+unchanged (the dongle-stored macro surface, its flash storage, the button
+trigger, and every byte format stay exactly as v5.12).
+
+### #2 — flash I/O moved off the BT RX thread (`macro.c`)
+
+`handle_put`/`handle_del` used to call `settings_save_one`/
+`settings_delete` synchronously on the BT RX thread via the
+`macro_rw_write` GATT callback — including NVS sector erases of
+~50–90 ms. That stalls the ATT server and is the same hang class that
+forced the macro store out in v5.6.
+
+`put_commit`/`slot_delete` are split into a RAM-only half
+(`put_commit_ram`/`slot_delete_ram`, still under `store_lock`, still fast
+and synchronous) and a deferred flash half. The write handler stages the
+result into RAM and returns success immediately; the flash mirroring runs
+on the system workqueue via a single coalescing `K_WORK`
+(`macro_persist_work`) carrying a 16-bit `persist_slots` dirty bitmap.
+Every RAM mutation sets its slot's bit and (re)submits the work; the work
+re-reads the current RAM state when it runs, so a burst of edits that
+coalesces is persisted once, as the latest state. `persist_slot()` copies
+the slot (name + template) into a static `persist_buf` under the lock,
+then does every flash call with the lock released — `store_lock` is never
+held across a flash operation. A deferred flash failure is logged and
+signalled as `0xE2` (`VKB_TX_ERR_FLASH`) on the existing status-notify
+path; RAM is left authoritative and uncorrupted.
+
+The store_lock audit still holds after the split: `slot_delete_ram`,
+`put_commit_ram` and `persist_slot`'s snapshot section are each a single
+lock/unlock with no early return between them; `schedule_persist` and the
+flash calls run unlocked.
+
+### #1 — RX ring overflow → silent keystroke loss (`typing.c`)
+
+`RX_RING_SIZE` is enlarged 512 → 16 KB so a full message/macro burst no
+longer overflows before the typing thread drains it. This is the
+firmware-only mitigation; the web-side gating is explicitly deferred, and
+the busy/idle status notify keeps emitting exactly as before (no protocol
+change).
+
+### #3 — `typing_reset()` no longer races the typing thread (`typing.c`)
+
+`typing_reset()` (BT RX thread, via `disconnected()`) previously mutated
+`ring_buf_reset` and the parser state while the typing thread could be
+mid-`process_byte()`. It now only sets a `reset_pending` flag and wakes
+the typing thread via `rx_sem`; the typing thread performs the actual
+`ring_buf_reset` + `esc_state`/`mouse_got`/`abs_got` clear on its own
+thread, and the modifier-release-all on disconnect is folded into that
+same deferred path (it already was, for the HID submit — now the whole
+reset is single-threaded).
+
+### #5 — `macro_list_json()` no longer returns a shared buffer (`macro.c`, `ble.c`, `vkb.h`)
+
+`macro_list_json()` built into a single static `list_json` and returned it
+after unlocking, so a concurrent MACRO_LIST notify could rebuild it while
+a read was still copying it out. It now rebuilds into a caller-provided
+buffer (sized `MACRO_LIST_JSON_MAX` from `vkb.h`) under `store_lock` and
+returns the length. `ble.c` gives the read path and the notify path each
+their own static buffer, so the two can never tear each other.
+
+### #7 — name saved first, so a failed put never orphans chunks (`macro.c`)
+
+`persist_slot()` saves `vkbm/<i>/n` before any template chunk. A name
+failure now returns with the previous flash state untouched (consistent),
+instead of leaving freshly-written chunks with a stale/absent name.
+
+### #8 — chunk rollback clears the full range, not just the new chunks (`macro.c`)
+
+On a chunk save failure, `persist_slot()` deletes the *entire* chunk range
+(`0..MACRO_NVS_CHUNKS_MAX-1`) plus the just-saved name, so a replacing put
+can never leave stale high-numbered old chunks behind and
+`macro_boot_finalize()` can never observe a non-contiguous chunk set. Stale
+chunks beyond the new length are also dropped on the happy path.
+
+### Version + build
+
+`prj.conf` DIS firmware revision string and `firmware/README.md` bumped to
+`vk-5.13`. Clean build: FLASH 224292 B (38.56%), RAM 151396 B (57.75%)
+(+34.6 KB vs v5.12: the 16 KB ring, the 16 KB `persist_buf`, and the two
+per-path list-json buffers). UF2 at `build/zephyr/zephyr.uf2`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

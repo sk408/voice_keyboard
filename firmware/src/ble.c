@@ -96,8 +96,13 @@ static ssize_t macro_list_read(struct bt_conn *conn,
 	 */
 	app_led_debug(APP_LED_NAME_READ);
 
-	uint16_t json_len;
-	const uint8_t *json = macro_list_json(&json_len);
+	/* Rebuild into a read-path-private buffer: macro_list_json() now
+	 * writes a caller-supplied buffer so a concurrent notify rebuild
+	 * cannot tear this read (v5.13 fix #5). GATT read callbacks all run
+	 * on the single BT RX thread, so this static is never re-entered.
+	 */
+	static char json[MACRO_LIST_JSON_MAX];
+	uint16_t json_len = macro_list_json(json, sizeof(json));
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, json, json_len);
 }
@@ -474,9 +479,10 @@ static void macro_list_notify_work_fn(struct k_work *work)
 
 	/* The list is rebuilt at send time, so the notification always
 	 * reflects the latest store state no matter when the work runs.
+	 * Rebuild into a notify-path-private buffer (v5.13 fix #5).
 	 */
-	uint16_t len;
-	const uint8_t *json = macro_list_json(&len);
+	static char json[MACRO_LIST_JSON_MAX];
+	uint16_t len = macro_list_json(json, sizeof(json));
 
 	/* MACRO_LIST value attribute (see layout above). NULL conn notifies
 	 * every peer that enabled the CCC. If the list outgrows the ATT MTU

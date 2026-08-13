@@ -17,7 +17,12 @@ LOG_MODULE_REGISTER(typing, LOG_LEVEL_INF);
 
 #include "vkb.h"
 
-#define RX_RING_SIZE	512
+/* v5.13: enlarged 512 -> 16 KB so a full macro burst cannot overflow the
+ * ring before the typing thread drains it (review #1). The web-side gating
+ * that would make overflow impossible is deferred; this is the firmware
+ * mitigation only.
+ */
+#define RX_RING_SIZE	16384
 #define RX_CHUNK_MAX	64
 
 /* ~15 ms per keystroke: press held 5 ms, then 10 ms idle after release. */
@@ -48,6 +53,7 @@ static bool busy;
 static uint8_t held_mods;	/* 0x82: stay down until 0x83 or disconnect */
 static uint8_t sticky_mods;	/* 0x81: apply to the next keystroke only */
 static bool release_mods_pending; /* deferred release-all on disconnect */
+static bool reset_pending;	/* set by typing_reset(), honoured by the thread */
 
 void typing_feed(const void *data, uint16_t len)
 {
@@ -81,23 +87,15 @@ void typing_play(const void *data, uint16_t len)
 
 void typing_reset(void)
 {
-	k_sem_reset(&rx_sem);
-	ring_buf_reset(&rx_ring);
-	esc_state = ESC_NONE;
-	mouse_got = 0;
-	abs_got = 0;
-
-	/* A disconnect while modifiers were held must not leave them stuck
-	 * on the host. This runs on the BLE RX thread, where the blocking
-	 * HID submit must not be called, so defer the release report to the
-	 * typing thread.
+	/* v5.13 fix #3: do NOT touch the ring buffer or parser state here.
+	 * This runs on the BT RX thread, where mutating ring_buf/esc_state
+	 * races the typing thread mid-process_byte(). Instead set a flag and
+	 * wake the typing thread; it performs the actual reset on its own
+	 * thread (and defers the modifier release report there too, where
+	 * the blocking HID submit is allowed).
 	 */
-	if (held_mods != 0 || sticky_mods != 0) {
-		held_mods = 0;
-		sticky_mods = 0;
-		release_mods_pending = true;
-		k_sem_give(&rx_sem);
-	}
+	reset_pending = true;
+	k_sem_give(&rx_sem);
 }
 
 /* Map printable US-ASCII to (modifier, HID keycode) on a US layout. */
@@ -351,6 +349,24 @@ static void typing_thread(void *p1, void *p2, void *p3)
 		uint32_t n;
 
 		k_sem_take(&rx_sem, K_FOREVER);
+
+		/* Deferred reset from typing_reset() (disconnect): drop pending
+		 * bytes and clear parser state here, on the typing thread, so
+		 * it never races a mid-parse byte. A disconnect while modifiers
+		 * were held also queues the host-side release-all below.
+		 */
+		if (reset_pending) {
+			reset_pending = false;
+			ring_buf_reset(&rx_ring);
+			esc_state = ESC_NONE;
+			mouse_got = 0;
+			abs_got = 0;
+			if (held_mods != 0 || sticky_mods != 0) {
+				held_mods = 0;
+				sticky_mods = 0;
+				release_mods_pending = true;
+			}
+		}
 
 		/* Deferred release-all from typing_reset() (disconnect while
 		 * modifiers were held): unblock the host-side modifiers.

@@ -25,6 +25,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/bluetooth/att.h>
+#include <zephyr/sys/atomic.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -79,6 +80,36 @@ static char put_name[MACRO_NAME_MAX];
 static uint8_t play_buf[MACRO_STORE_MAX];
 
 static K_MUTEX_DEFINE(store_lock);
+
+/* --- deferred flash persistence (v5.13) ------------------------------------
+ *
+ * settings_save_one()/settings_delete() can take ~50-90 ms (NVS sector
+ * erase) and must never run on the BT RX thread — that is the exact hang
+ * class that forced the macro store out in v5.6. handle_put()/handle_del()
+ * therefore mutate the in-RAM store synchronously (fast, under the lock)
+ * and then schedule the flash mirroring on the system workqueue.
+ *
+ * A single coalescing K_WORK carries a per-slot dirty bitmap: every RAM
+ * mutation sets its slot's bit and (re)submits the work. Because the work
+ * re-reads the current RAM state when it finally runs, a burst of edits
+ * that coalesces before the work runs is persisted exactly once, as the
+ * latest state. store_lock is never held across a flash operation — the
+ * work snapshots the slot under the lock and then does all flash I/O with
+ * the lock released.
+ */
+static void macro_persist_work_fn(struct k_work *work);
+static K_WORK_DEFINE(macro_persist_work, macro_persist_work_fn);
+static ATOMIC_DEFINE(persist_slots, MACRO_SLOTS); /* bit i = slot i dirty */
+/* Snapshot of the slot being persisted: copied under store_lock so the
+ * flash writes below can run unlocked without racing arena compaction.
+ */
+static uint8_t persist_buf[MACRO_STORE_MAX];
+
+static void schedule_persist(uint8_t i)
+{
+	atomic_set_bit(persist_slots, i);
+	k_work_submit(&macro_persist_work);
+}
 
 /* --- budget accounting ------------------------------------------------- */
 
@@ -143,13 +174,14 @@ static void arena_append(int i, const uint8_t *data, uint16_t len)
 
 /* Worst case per entry: {"i":15,"name":"","len":16384}, is ~31 chars plus
  * the name at up to 6 chars per byte (every byte escaped as \u00XX).
+ * The caller supplies the destination buffer (sized MACRO_LIST_JSON_MAX in
+ * vkb.h); see macro_list_json() for why this avoids the v5.5 shared-buffer
+ * tear.
  */
-static char list_json[MACRO_SLOTS * (MACRO_NAME_MAX * 6 + 32) + 4];
-static uint16_t list_json_len;
 
 /* Append name JSON-escaped to out; never writes past out_max (including the
  * \0 snprintf needs). Truncation cannot happen with a correctly sized
- * list_json, but stay bounded regardless.
+ * buffer, but stay bounded regardless.
  */
 static size_t json_escape_name(char *out, size_t out_max, const char *name,
 			       uint8_t len)
@@ -180,39 +212,45 @@ static size_t json_escape_name(char *out, size_t out_max, const char *name,
 	return n;
 }
 
-/* Rebuild the MACRO_LIST value, e.g. [{"i":0,"name":"SOAP note","len":412}].
- * Must be called with store_lock held.
+/* Rebuild the MACRO_LIST value, e.g. [{"i":0,"name":"SOAP note","len":412}],
+ * into caller-provided out. Must be called with store_lock held.
  */
-static void list_json_rebuild(void)
+static uint16_t list_json_rebuild(char *out, size_t out_size)
 {
 	size_t n = 0;
 
-	list_json[n++] = '[';
+	out[n++] = '[';
 	for (int i = 0; i < MACRO_SLOTS; i++) {
 		struct macro_slot *s = &slots[i];
 
 		if (!s->used) {
 			continue;
 		}
-		n += snprintf(&list_json[n], sizeof(list_json) - n,
+		n += snprintf(&out[n], out_size - n,
 			      "%s{\"i\":%d,\"name\":\"", n > 1 ? "," : "", i);
-		n += json_escape_name(&list_json[n], sizeof(list_json) - n - 16,
+		n += json_escape_name(&out[n], out_size - n - 16,
 				      s->name, s->name_len);
-		n += snprintf(&list_json[n], sizeof(list_json) - n,
+		n += snprintf(&out[n], out_size - n,
 			      "\",\"len\":%u}", s->len);
 	}
-	list_json[n++] = ']';
-	list_json[n] = '\0';
-	list_json_len = n;
+	out[n++] = ']';
+	out[n] = '\0';
+	return n;
 }
 
-const uint8_t *macro_list_json(uint16_t *len)
+/* Rebuild the MACRO_LIST value into the caller's buffer and return its
+ * length. The caller owns buf, so a read and a notify rebuilding into two
+ * different buffers can never tear each other even though the store lock
+ * is released before the caller finishes copying out of buf.
+ */
+uint16_t macro_list_json(char *buf, size_t buf_size)
 {
+	uint16_t len;
+
 	k_mutex_lock(&store_lock, K_FOREVER);
-	list_json_rebuild();
+	len = list_json_rebuild(buf, buf_size);
 	k_mutex_unlock(&store_lock);
-	*len = list_json_len;
-	return (const uint8_t *)list_json;
+	return len;
 }
 
 /* Queue a store-changed notification for subscribed centrals. Caller holds
@@ -515,63 +553,21 @@ static uint16_t chunks_for(uint16_t len)
 	return (len + MACRO_NVS_CHUNK - 1) / MACRO_NVS_CHUNK;
 }
 
-/* Delete slot i's persisted keys and free its arena range.
- * Caller holds store_lock.
+/* Delete slot i's RAM representation (no flash I/O). Caller holds
+ * store_lock; the flash deletion is deferred to the workqueue.
  */
-static void slot_delete(uint8_t i)
+static void slot_delete_ram(uint8_t i)
 {
-	char key[16];
-
-	for (uint16_t k = 0; k < chunks_for(slots[i].len); k++) {
-		snprintk(key, sizeof(key), "vkbm/%u/t/%u", i, k);
-		settings_delete(key);
-	}
-	snprintk(key, sizeof(key), "vkbm/%u/n", i);
-	settings_delete(key);
-
 	arena_remove(i);
 	slots[i].name_len = 0;
 	LOG_INF("Macro %u deleted (store %u/%u)", i, store_used(), MACRO_STORE_MAX);
 }
 
-/* Commit a finished put: persist first, then update the in-RAM store.
+/* Commit a finished put into the in-RAM store (no flash I/O).
  * Caller holds store_lock; put_len > 0 (an empty put deletes the slot).
  */
-static int put_commit(void)
+static void put_commit_ram(void)
 {
-	char key[16];
-	int err;
-	uint16_t old_chunks = chunks_for(slots[put_i].used ? slots[put_i].len : 0);
-	uint16_t new_chunks = chunks_for(put_len);
-
-	for (uint16_t k = 0; k < new_chunks; k++) {
-		uint16_t clen = MIN(MACRO_NVS_CHUNK, put_len - k * MACRO_NVS_CHUNK);
-
-		snprintk(key, sizeof(key), "vkbm/%u/t/%u", put_i, k);
-		err = settings_save_one(key, &staging[k * MACRO_NVS_CHUNK], clen);
-		if (err) {
-			LOG_ERR("Failed to persist macro %u chunk %u (%d)", put_i, k, err);
-			while (k-- > 0) { /* best-effort rollback */
-				snprintk(key, sizeof(key), "vkbm/%u/t/%u", put_i, k);
-				settings_delete(key);
-			}
-			return err;
-		}
-	}
-
-	snprintk(key, sizeof(key), "vkbm/%u/n", put_i);
-	err = settings_save_one(key, put_name, put_name_len);
-	if (err) {
-		LOG_ERR("Failed to persist macro %u name (%d)", put_i, err);
-		return err;
-	}
-
-	/* Drop chunks left over from a previously longer template. */
-	for (uint16_t k = new_chunks; k < old_chunks; k++) {
-		snprintk(key, sizeof(key), "vkbm/%u/t/%u", put_i, k);
-		settings_delete(key);
-	}
-
 	arena_remove(put_i);
 	arena_append(put_i, staging, put_len);
 	slots[put_i].name_len = put_name_len;
@@ -579,7 +575,98 @@ static int put_commit(void)
 	LOG_INF("Macro %u stored: \"%.*s\", %u bytes (store %u/%u)",
 		put_i, put_name_len, put_name, put_len,
 		store_used(), MACRO_STORE_MAX);
-	return 0;
+}
+
+/* Mirror one slot's current RAM state into settings/NVS. Runs on the
+ * system workqueue (never the BT RX thread) and never holds store_lock
+ * across a flash call: the slot is snapshotted under the lock, then all
+ * flash I/O happens with the lock released.
+ *
+ * RAM is authoritative for the current session, so a failed write is
+ * logged and signalled on the status-notify path and RAM is left intact.
+ * #7: the name is saved first, so a name failure leaves the previous
+ * flash state (chunks untouched) consistent. #8: a chunk failure clears
+ * the FULL chunk range (and the just-saved name), so the slot is fully
+ * absent and macro_boot_finalize() never sees non-contiguous chunks.
+ */
+static void persist_slot(uint8_t i)
+{
+	char key[16];
+	char name[MACRO_NAME_MAX];
+	uint8_t name_len;
+	uint16_t len;
+	bool used;
+	int err;
+
+	k_mutex_lock(&store_lock, K_FOREVER);
+	used = slots[i].used;
+	name_len = slots[i].name_len;
+	len = slots[i].len;
+	memcpy(name, slots[i].name, name_len);
+	if (used) {
+		memcpy(persist_buf, &arena[slots[i].off], len);
+	}
+	k_mutex_unlock(&store_lock);
+
+	if (!used || len == 0) {
+		/* Slot absent: delete the name and every possible chunk. */
+		snprintk(key, sizeof(key), "vkbm/%u/n", i);
+		settings_delete(key);
+		for (uint16_t k = 0; k < MACRO_NVS_CHUNKS_MAX; k++) {
+			snprintk(key, sizeof(key), "vkbm/%u/t/%u", i, k);
+			settings_delete(key);
+		}
+		return;
+	}
+
+	uint16_t new_chunks = chunks_for(len);
+
+	snprintk(key, sizeof(key), "vkbm/%u/n", i);
+	err = settings_save_one(key, name, name_len);
+	if (err) {
+		LOG_ERR("Failed to persist macro %u name (%d)", i, err);
+		ble_notify_status(VKB_TX_ERR_FLASH);
+		return;
+	}
+
+	for (uint16_t k = 0; k < new_chunks; k++) {
+		uint16_t clen = MIN(MACRO_NVS_CHUNK, len - k * MACRO_NVS_CHUNK);
+
+		snprintk(key, sizeof(key), "vkbm/%u/t/%u", i, k);
+		err = settings_save_one(key, &persist_buf[k * MACRO_NVS_CHUNK], clen);
+		if (err) {
+			LOG_ERR("Failed to persist macro %u chunk %u (%d)", i, k, err);
+			ble_notify_status(VKB_TX_ERR_FLASH);
+			/* #8: clear the full chunk range (not just the chunks
+			 * written so far) plus the name, leaving the slot
+			 * fully absent.
+			 */
+			for (uint16_t kk = 0; kk < MACRO_NVS_CHUNKS_MAX; kk++) {
+				snprintk(key, sizeof(key), "vkbm/%u/t/%u", i, kk);
+				settings_delete(key);
+			}
+			snprintk(key, sizeof(key), "vkbm/%u/n", i);
+			settings_delete(key);
+			return;
+		}
+	}
+
+	/* Drop chunks left over from a previously longer template. */
+	for (uint16_t k = new_chunks; k < MACRO_NVS_CHUNKS_MAX; k++) {
+		snprintk(key, sizeof(key), "vkbm/%u/t/%u", i, k);
+		settings_delete(key);
+	}
+}
+
+static void macro_persist_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	for (uint8_t i = 0; i < MACRO_SLOTS; i++) {
+		if (atomic_test_and_clear_bit(persist_slots, i)) {
+			persist_slot(i);
+		}
+	}
 }
 
 static int handle_put(const struct macro_req *req)
@@ -636,19 +723,17 @@ static int handle_put(const struct macro_req *req)
 		if (put_len == 0) {
 			/* An empty template stores nothing: delete the slot. */
 			if (slots[put_i].used) {
-				slot_delete(put_i);
+				slot_delete_ram(put_i);
+				schedule_persist(put_i);
 			}
-			k_mutex_unlock(&store_lock);
-			notify_list_changed();
-			return 0;
+		} else {
+			put_commit_ram();
+			schedule_persist(put_i);
 		}
-		int err = put_commit();
-
+		/* Flash persistence is deferred: the staged RAM result is
+		 * authoritative and the GATT write reports success now.
+		 */
 		k_mutex_unlock(&store_lock);
-		if (err) {
-			ble_notify_status(VKB_TX_ERR_STORE_FULL);
-			return -EIO;
-		}
 		notify_list_changed();
 		return 0;
 	}
@@ -670,7 +755,8 @@ static int handle_del(const struct macro_req *req)
 		return 0; /* deleting an empty slot is a no-op */
 	}
 
-	slot_delete(req->i);
+	slot_delete_ram(req->i);
+	schedule_persist(req->i);
 
 	k_mutex_unlock(&store_lock);
 	notify_list_changed();

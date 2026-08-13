@@ -54,6 +54,7 @@ int ble_init(void);
 void ble_notify_status(uint8_t status);
 /* TX error codes (0xE0+), sent on the same NUS TX characteristic. */
 #define VKB_TX_ERR_STORE_FULL	0xE1	/* macro store budget exhausted */
+#define VKB_TX_ERR_FLASH	0xE2	/* deferred macro flash persistence failed */
 /* Open the 60 s bonding window (called on dongle button press). */
 void ble_open_pairing_window(void);
 /* True while a BLE connection is active (gates the macro trigger). */
@@ -63,8 +64,13 @@ bool ble_is_connected(void);
 void ble_notify_macro_list(void);
 
 /* --- Macro store (macro.c), see PROTOCOL.md v5 section --- */
-/* MACRO_LIST read value: JSON array, e.g. [{"i":0,"name":"x","len":412}]. */
-const uint8_t *macro_list_json(uint16_t *len);
+/* Worst-case MACRO_LIST JSON size (16 slots, each name byte escaped as
+ * \u00XX). Callers pass a buffer this large to macro_list_json().
+ */
+#define MACRO_LIST_JSON_MAX	(16 * (24 * 6 + 32) + 4)
+/* Rebuild the MACRO_LIST JSON value into caller-provided buf (>= size
+ * MACRO_LIST_JSON_MAX); returns the length (excluding NUL). */
+uint16_t macro_list_json(char *buf, size_t buf_size);
 /* MACRO_RW write handler: returns 0, or a negative BT_ATT_ERR_* code. */
 int macro_write(const uint8_t *buf, uint16_t len);
 /* MACRO_RW read value: response prepared by the last "get" write. */
