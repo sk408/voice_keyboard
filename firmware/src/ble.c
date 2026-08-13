@@ -211,6 +211,24 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
+	/* v5.7: force encryption. The RX characteristic is WRITE_ENCRYPT
+	 * (a web-app write-without-response to it on an unencrypted link is
+	 * silently dropped, since a Write Command has no ATT error reply),
+	 * and until now nothing requested a security upgrade — so
+	 * web-app-only pairing connected + subscribed (9 blinks) but never
+	 * typed. With no bond this triggers Just Works pairing (auth_cb is
+	 * cancel-only, I/O caps default to NoInputNoOutput); with an
+	 * existing bond it re-encrypts from the stored LTK. A peer already
+	 * rejected by the gate above never reaches this call.
+	 */
+	{
+		int ret = bt_conn_set_security(conn, BT_SECURITY_L2);
+
+		if (ret) {
+			LOG_WRN("Failed to request security (L2): %d", ret);
+		}
+	}
+
 	current_conn = bt_conn_ref(conn);
 	app_led_connected();
 	LOG_INF("Connected");

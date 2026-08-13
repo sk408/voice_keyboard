@@ -505,6 +505,61 @@ MACRO_LIST/MACRO_RW `getCharacteristic()` calls (`macroList`/`macroRw` =
 null → `supportsMacroStore` false) and `web/src/store.ts` falls back to
 localStorage macros. DIS firmware revision is `vk-5.6`.
 
+## v5.7: web-app-only pairing connects but never types — force encryption
+
+Hardware observation on v5.6: the web app connects cleanly, TX subscribe
+fires (9 blinks), no errors — but the dongle never acts as a keyboard.
+The only ever-working version (v2, 986f3f1) required OS-menu pairing first,
+then the web-app connect; web-app-only pairing "had this same behavior" in
+v2. On current firmware the OS-holds-the-connection one-central limit makes
+the v2 two-step flow unreproducible, so the keystroke path must be made to
+work from a web-app-only connection.
+
+Root cause: the RX characteristic is `BT_GATT_PERM_WRITE_ENCRYPT`, so a
+keystroke write needs an *encrypted* link, but nothing in `firmware/src/`
+ever called `bt_conn_set_security()` — the dongle never proactively
+escalates the link. The web app (`web/src/ble.ts` `send()`) prefers
+`writeValueWithoutResponse` when the characteristic advertises it (RX has
+`BT_GATT_CHRC_WRITE_WITHOUT_RESP`), and a Write Command to an
+ENCRYPT-only characteristic on an unencrypted link is dropped by the ATT
+server with no error reply (a command has no response PDU) — exactly
+"connects fine, no errors, but no typing". TX + its CCC are permission-free
+(`BT_GATT_PERM_NONE` / `READ|WRITE`), which is why connect + subscribe
+succeed with no pairing. Web Bluetooth does not expose the ATT
+"Encryption Required" attribute permission to JS, so Chrome has no reason
+to encrypt before the first write; v2 only worked because the OS-level
+pair had already produced a bond + encryption the web app reused.
+
+Fix (`ble.c` `connected()`, after the bonded-peer gate):
+`bt_conn_set_security(conn, BT_SECURITY_L2)` on every accepted connection.
+With no stored bond this sends a SMP Security Request and triggers **Just
+Works** pairing from the central; with an existing bond it re-encrypts from
+the stored LTK. Verified against the Zephyr 4.1.0 tree:
+
+- `bt_conn_set_security()` → `start_security()` → (peripheral role)
+  `bt_smp_start_security()` → `smp_send_security_req()`; the peripheral
+  emits a Security Request PDU and the central (Chrome) pairs/encrypts.
+- `BT_SECURITY_L2` is sufficient for `BT_GATT_PERM_WRITE_ENCRYPT`:
+  `sec_level_reachable()` (`smp.c:2756`) returns `true` unconditionally for
+  L1/L2, and `remote_sec_level_reachable()` returns 0 for L2.
+- Just Works completes with the existing cancel-only `auth_cb`:
+  `get_io_capa()` (`smp.c:335`) returns `BT_SMP_IO_NO_INPUT_OUTPUT` when no
+  passkey/pairing callbacks are set (only `cancel`), and with
+  `CONFIG_BT_SMP_SC_PAIR_ONLY=y` the `pairing_confirm` callback is never
+  consulted (the SC Just Works path skips it, `smp.c:3062`) — no user
+  interaction, no new callback needed.
+
+Reconciled with the v5.3 gate (unchanged): the `bt_conn_set_security()`
+call is placed *after* the `!pairing_window_open && !peer_is_bonded()`
+rejection, so a peer connecting inside the 60 s window (or the bondless
+recovery boot window) is accepted and then paired + bonded + encrypted; a
+bonded peer outside the window re-encrypts from its LTK; an unbonded peer
+outside the window is still rejected before any security escalation. The
+60 s pairing window, bondless recovery, `bt_set_bondable()` toggling, and
+the workqueue-notify rule are all untouched.
+
+DIS firmware revision is `vk-5.7`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.
