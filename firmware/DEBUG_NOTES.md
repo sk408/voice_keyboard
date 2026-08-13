@@ -560,6 +560,52 @@ the workqueue-notify rule are all untouched.
 
 DIS firmware revision is `vk-5.7`.
 
+## v5.8: pairing dialog appears then the central drops — NoInputNoOutput can't satisfy Chrome's MITM
+
+Hardware observation on v5.7: the web app connects, the OS pairing dialog
+appears, then after a few seconds the web app loses the connection while the
+green LED stays solid — the dongle still considers the link connected, but
+pairing never completes.
+
+Root cause, statically proven against the Zephyr 4.1.0 tree:
+
+- The RX characteristic is `BT_GATT_PERM_WRITE_ENCRYPT`, so v5.7 calls
+  `bt_conn_set_security(conn, BT_SECURITY_L2)` in `connected()`. As a
+  peripheral that sends a SMP **Security Request**
+  (`smp_send_security_req()`, smp.c:2874), prompting the central to pair.
+- The peripheral's `auth_cb` registered only `cancel`, so `get_io_capa()`
+  (smp.c:335) returns `BT_SMP_IO_NO_INPUT_OUTPUT`. Per Core Spec Vol 3
+  Part H 2.3.5.1 (Table 2.8), a NoInputNoOutput participant forces the
+  **Just Works** association model — MITM is impossible.
+- `get_auth()` (smp.c:2683) therefore clears the MITM bit from the
+  peripheral's auth requirements (its `get_io_capa` is NoInputNoOutput),
+  so the Security Request advertises SC|bonding with no MITM.
+- Chrome's Web Bluetooth pairing (BlueZ desktop agent, DisplayYesNo or
+  KeyboardDisplay I/O capability) **requires MITM** (authenticated)
+  pairing, unlike a manual OS-settings pair which accepts Just Works —
+  exactly why v2's "pair from the OS menu first" worked but v5.7's
+  web-app-only flow did not. Facing a NoInputNoOutput responder, the
+  central cannot establish an authenticated link and aborts the pairing
+  after its timeout: the OS dialog appears, then the link drops.
+
+Fix (this commit): report `BT_SMP_IO_DISPLAY_YESNO` by registering
+`passkey_display` and `passkey_confirm` on the `auth_cb`. With a
+DisplayYesNo/KeyboardDisplay central this selects LE SC **numeric
+comparison** (`gen_method_sc`, smp.c:238) — MITM-capable — and, combined
+with the default `CONFIG_BT_SMP_ENFORCE_MITM=y`, `get_auth()` now sets the
+MITM bit so the central's requirement is met. `auth_passkey_confirm()`
+auto-confirms the passkey from the system workqueue (deferred like the
+v5.4 status notify — the SMP confirm callback runs on the BT RX thread and
+the stack expects the reply after the pairing-random exchange); the human
+verifies the number on the central, the only side with a screen. The
+`bt_conn_set_security(L2)` intent is unchanged: L2 is still sufficient for
+`BT_GATT_PERM_WRITE_ENCRYPT` (att.c/gatt.c), and numeric comparison simply
+lands on L3/L4, which exceeds it. `auth_passkey_display()` only logs (no
+screen); it is reached only for passkey-entry pairing with a keyboard-only
+central, not a desktop browser.
+
+DIS firmware revision is `vk-5.8`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

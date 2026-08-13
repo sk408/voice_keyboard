@@ -267,15 +267,70 @@ BT_CONN_CB_DEFINE(conn_cbs) = {
 	.security_changed = security_changed,
 };
 
-/* No input/output capabilities -> Just Works pairing. */
+/* v5.8: DisplayYesNo I/O capability (LE SC numeric comparison). Chrome's
+ * Web Bluetooth pairing requires MITM (authenticated) pairing, which a
+ * NoInputNoOutput peripheral cannot provide — its only association model
+ * is Just Works, and the central aborts the pairing when it cannot get an
+ * authenticated link (the v5.7 symptom: the OS pairing dialog appears,
+ * then the central drops the link after a few seconds). Reporting
+ * DisplayYesNo (passkey_display + passkey_confirm both set) selects
+ * numeric comparison; the passkey is confirmed automatically because the
+ * dongle has neither a display nor an input, and the human verifies the
+ * number on the central — the only side with a screen. See DEBUG_NOTES.md
+ * v5.8.
+ */
 static void auth_cancel(struct bt_conn *conn)
 {
 	ARG_UNUSED(conn);
 	LOG_INF("Pairing cancelled");
 }
 
+/* Only passkey-entry pairing with a keyboard-only central reaches this
+ * (numeric comparison uses passkey_confirm, which carries the passkey);
+ * the dongle has no screen, so just log it.
+ */
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("Passkey: %06u", passkey);
+}
+
+static void passkey_confirm_work_fn(struct k_work *work);
+
+static K_WORK_DEFINE(passkey_confirm_work, passkey_confirm_work_fn);
+
+static void passkey_confirm_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!current_conn) {
+		return;
+	}
+
+	int err = bt_conn_auth_passkey_confirm(current_conn);
+
+	if (err) {
+		LOG_WRN("Passkey confirm failed (%d)", err);
+	}
+}
+
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	ARG_UNUSED(conn);
+
+	LOG_INF("Confirming passkey %06u", passkey);
+	/* Defer the reply to the system workqueue: the SMP passkey-confirm
+	 * callback runs on the BT RX thread and the stack expects the
+	 * confirmation after it has finished processing the pairing-random
+	 * exchange (same defer-to-workqueue rule as the v5.4 status notify).
+	 */
+	k_work_submit(&passkey_confirm_work);
+}
+
 static struct bt_conn_auth_cb auth_cb = {
 	.cancel = auth_cancel,
+	.passkey_display = auth_passkey_display,
+	.passkey_confirm = auth_passkey_confirm,
 };
 
 /* --- Notifications ---------------------------------------------------------
