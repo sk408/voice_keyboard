@@ -1,11 +1,12 @@
-# Voice Keyboard firmware — nRF52840 dongle
+# Voice Keyboard firmware — nRF52840 dongle (v6.0)
 
 Zephyr 4.1.0 application for the Nordic PCA10059 dongle (Adafruit UF2
 bootloader). The dongle enumerates as a single composite USB HID device —
 keyboard (report ID 1) + mouse (report ID 2) + absolute pointer
-(report ID 3) in one report descriptor — and receives keystrokes, mouse
-packets and absolute pointer packets over BLE NUS per
-[`../PROTOCOL.md`](../PROTOCOL.md).
+(report ID 3) in one report descriptor — and, over BLE NUS, speaks the
+**InputStick packet protocol** so the free InputStick iOS/Android apps
+connect, reach "Ready", and type (see
+[`../../INPUTSTICK_EMULATION_SPEC.md`](../../INPUTSTICK_EMULATION_SPEC.md)).
 
 ## Build
 
@@ -31,13 +32,11 @@ Output: `~/voice_keyboard/firmware/build/zephyr/zephyr.uf2`.
 The app is linked at `0x26000` (Adafruit bootloader layout: MBR + SoftDevice
 below, bootloader at `0xF4000`) and does not touch the bootloader.
 
-**v5 flash-layout change**: the settings storage partition moved from the
-stock 16 KB at `0xDC000` to 32 KB at `0xB4000` (tail of the unused slot1
-partition; the app is capped below it via `CONFIG_FLASH_LOAD_SIZE`),
-originally to make room for the macro store next to the bonds — the macro
-store is removed for good in v5.14, so the partition now holds only bonds.
-Side effect of flashing v5 over ≤v4: bonds stored in the old partition
-are not migrated — re-pair once.
+**Storage partition**: settings/NVS lives at `0xB4000` (32 KB, tail of the
+unused slot1 partition; the app is capped below it via
+`CONFIG_FLASH_LOAD_SIZE`). v6.0 stores no bonds, but the partition and the
+v5.2 mount/repair path stay so a flash of garbage at that address can never
+abort `bt_enable()`.
 
 ## Behavior
 
@@ -51,72 +50,52 @@ are not migrated — re-pair once.
   acceleration. Because the descriptor uses report
   IDs, the interface claims **no boot protocol** (`protocol-code = "none"`)
   — the keyboard does not work in BIOS/UEFI/pre-boot environments.
-- **BLE**: advertises as `VoiceKB` (fixed compiled-in name; the v3
-  user-settable name was removed in v5.5, see DEBUG_NOTES.md) with
-  the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
-  write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-5.14`.
-- **Macro store (v5) — removed for good in v5.14**: the MACRO_LIST/MACRO_RW
-  characteristics, the flash-backed 16-slot/16 KB macro store (`macro.c`),
-  and the standalone long-press trigger hung on hardware across v5.x,
-  v5.12, and v5.13 (saving macros reported a chunked MACRO_RW get response
-  that ended early, then the dongle stopped responding), so they are
-  removed for good (see DEBUG_NOTES.md v5.14). `macro.c` stays in the tree
-  but is excluded from the build; the protocol documentation lives in git
-  history (v5.13, 1ce9ca0). A long button press now does nothing; short
-  press remains the 60 s pairing window.
-- **Typing**: RX bytes are reassembled as a byte stream (robust to any BLE
-  chunking, including escape sequences split across chunk boundaries) and
-  typed on a US layout at ~15 ms/keystroke. Shift handling for
-  capitals/symbols is done in firmware. `\n` = Enter, `\t` = Tab, `0x08` =
-  Backspace, `0x00`-escaped special keys per the protocol.
-- **Modifiers (v2)**: `0x00 0x81 <mask>` arms sticky modifiers for the next
-  keystroke (then auto-release), `0x00 0x82 <mask>` holds modifiers down
-  (pressed immediately, so they also modify host-side mouse clicks),
-  `0x00 0x83` releases all. The mask is the HID modifier byte. Held and
-  sticky modifiers compose with each other and with the keystroke's own
-  shift handling. A BLE disconnect while modifiers are held releases them
-  on the host.
-- **Mouse (v2)**: `0x00 0x90 <buttons> <dx> <dy> <wheel>` emits a mouse
-  report (report ID 2); buttons bit0 left / bit1 right / bit2 middle, deltas
-  clamped to the descriptor range −127..127. Mouse packets bypass the
-  keystroke rate limit.
-- **Absolute pointer (v4)**: `0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo>
-  <y_hi>` emits an absolute pointer report (report ID 3, a Generic Desktop
-  Pointer with absolute X/Y); buttons as for the mouse, x/y =
-  uint16 LE 0..32767 normalized screen position. Absolute pointer packets
-  bypass the keystroke rate limit.
-- **Status**: TX notifies `0x01` (busy) while the keystroke queue is being
-  typed, `0x00` (idle) when drained. Best effort.
+- **BLE**: advertises as `InputStick` with the NUS service UUID
+  (`6E400001-...`). RX `6E400002-...` (write / write-no-resp, **plain** —
+  no encryption/pairing), TX `6E400003-...` (notify, InputStick packets).
+  DIS firmware revision string: `vk-6.0`.
+- **Protocol**: the InputStick packet protocol (see the spec §3/§4):
+  `0x55` tag, 16-byte-block header with response/encrypt/HMAC flags, CRC32
+  (IEEE 802.3) over command+param+data, zero-padded to a multiple of 16.
+- **Handshake** (§5 + §9b): replies to `RunFirmware` (0x04) and
+  `GetFirmwareInfo` (0x10, reports firmware version 100, no password),
+  `CMD_INIT` (0x11, Android), and `SetUpdateInterval` (0x31); then emits one
+  `HIDStatusNotification` (0x2F) reporting `USBConfigured` so the app reaches
+  "Ready".
+- **HID mapping** (§6): `HIDDataKeyboardShort` (0x2C, 2-byte
+  `[modifiers, keycode]`) is the dictation path — each report is typed as a
+  press→release tap. `HIDDataKeyboard` (0x21, 8-byte) forwards
+  `[mods, key0]` (single-key rollover), `HIDDataMouse` (0x23) forwards
+  `[buttons, dx, dy, scroll]`, and `HIDDataTouchScreen` (0x26) forwards
+  `[reportID, tip, x, y]` to the absolute pointer (16-bit x/y scaled to
+  15-bit). Unimplemented commands get a `RESP_OK (0x01)` when the response
+  flag is set, else are ignored.
+- **Status / flow control**: M2 sends only the single Ready notification;
+  the periodic (400 ms) `HIDStatusNotification` + drain counter + report
+  buffer that complete the flow-control contract are M3 (TODO).
 - **LED** (green LED0): slow blink = advertising, solid = connected.
   Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
   report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
-  interface ready, 4 = mouse packet received, 5 = absolute pointer packet
-  received (6 = macro playback started, v5 only — unused since v5.14). At boot the red LED also runs a
-  stage trace (1→5 blinks in slow groups: main, USB up, BLE up, settings
-  loaded, advertising up) — the last group seen pinpoints a boot hang.
-  Long (400 ms) blinks are boot sub-stages on the bt_enable() path, and
-  repeating patterns signal unrecoverable boot errors or hard faults —
-  see DEBUG_NOTES.md (v5.2) for the full table.
+  interface ready, 4 = mouse report received, 5 = absolute pointer report
+  received, 9 = TX subscribed; v6.0 adds 11 = packet CRC mismatch (200ms x2),
+  12 = control packet dispatched (200ms x3), 13 = Ready notification sent
+  (200ms x4). At boot the red LED also runs a stage trace (1→5 blinks in
+  slow groups: main, USB up, BLE up, settings loaded, advertising up), plus
+  long (400 ms) sub-stage markers and repeating patterns for unrecoverable
+  errors — see DEBUG_NOTES.md (v5.2).
 
 ## Pairing / security
 
-- LE bonding (Just Works) is required: RX writes need an encrypted link.
-- The dongle is **bondable only for 60 s after a single press of the onboard
-  button**. Press the button, then pair from the central.
-- Outside the window, only already-bonded centrals may connect; unbonded
-  peers are disconnected. An unbonded peer still connected when the window
-  expires is disconnected too.
-- Bond keys are persisted in flash (settings subsystem, `storage` partition),
-  so reconnects after reboot do not need the pairing window.
-- To re-pair a central, press the button again to reopen the window.
+None. v6.0 is plain NUS: the InputStick apps connect and write unencrypted,
+no bonding, no MITM, no pairing window (see the spec §2/§9.1). The onboard
+button does nothing.
 
 ## Known limitations
 
-- **Non-ASCII input is dropped.** The protocol's "printable UTF-8" is
-  honored for the ASCII range only; characters outside US-ASCII (e.g. é, ü,
-  CJK) cannot be produced on a plain US HID layout and are silently skipped
-  (multi-byte UTF-8 sequences are dropped byte-wise).
+- **Flow control is incomplete (M2).** Without the periodic
+  `HIDStatusNotification` + drain counter (M3), a long dictation burst will
+  eventually stop once the app's remote-buffer free-space counter reaches
+  zero. Short bursts type fine.
 - **USB VID/PID** is `0x1209/0x0001` (pid.codes community VID). The PID is
   not officially registered; fine for personal use, not for distribution.
 - **No HID boot protocol**: the composite keyboard+mouse descriptor uses
@@ -125,6 +104,8 @@ are not migrated — re-pair once.
 - Only one BLE connection at a time (Zephyr default `CONFIG_BT_MAX_CONN=1`).
 - HID output reports (host-driven Num/Caps/Scroll Lock LEDs) are accepted
   but ignored — the dongle LED reflects BLE state instead.
+- Consumer/System/Gamepad reports, encryption/AES/HMAC, keygen, bootloader
+  and firmware update are not implemented (later milestones).
 - Logs go to SEGGER RTT (viewable with a J-Link); there is no UART console.
 
 ## Layout
@@ -132,17 +113,17 @@ are not migrated — re-pair once.
 ```
 firmware/
 ├── CMakeLists.txt
-├── prj.conf                              # UF2 offset, USB HID, BLE, SMP, settings
+├── prj.conf                              # UF2 offset, USB HID, BLE, settings
 ├── boards/
-│   └── nrf52840dongle_nrf52840.overlay   # zephyr,hid-device node
+│   └── nrf52840dongle_nrf52840.overlay   # zephyr,hid-device node + storage partition
 └── src/
-    ├── main.c      # init, LED state machine, pairing button (debounced)
-    ├── usb_kbd.c   # usbd (next stack) setup + composite HID keyboard+mouse+abs pointer
-    ├── ble.c       # NUS-compatible GATT service, adv, bonding window, gating
-    ├── typing.c    # RX byte stream -> HID reports, US keymap, v2/v4 escapes
-    └── vkb.h       # internal interfaces
+    ├── main.c        # init, LED state machine, button (debounced, no-op)
+    ├── usb_kbd.c     # usbd (next stack) setup + composite HID kbd+mouse+abs pointer
+    ├── ble.c         # plain NUS GATT service, adv, notify queue, NVS repair
+    ├── inputstick.c  # InputStick packet layer + handshake + HID mapping
+    └── vkb.h         # internal interfaces
 ```
 
-The built-in Zephyr NUS service is **not** used: its RX characteristic
-allows unencrypted writes, while the protocol requires an encrypted link.
-`ble.c` defines an identical-UUID service with `BT_GATT_PERM_WRITE_ENCRYPT`.
+The built-in Zephyr NUS service is **not** used; `ble.c` defines an
+identical-UUID service so the RX characteristic is plain `BT_GATT_PERM_WRITE`
+and the attribute layout stays explicit.

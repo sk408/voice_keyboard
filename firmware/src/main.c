@@ -1,4 +1,4 @@
-/* Voice Keyboard — application glue: LED feedback, pairing button, init. */
+/* Voice Keyboard — application glue: LED feedback, button, init. */
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
@@ -189,6 +189,15 @@ void app_led_debug(enum app_led_code code)
 	case APP_LED_NAME_READ:
 		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 10;
 		break;
+	case APP_LED_IS_CRC_FAIL:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 2;
+		break;
+	case APP_LED_IS_PKT:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 3;
+		break;
+	case APP_LED_IS_READY:
+		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 4;
+		break;
 	default:
 		return;
 	}
@@ -198,9 +207,10 @@ void app_led_debug(enum app_led_code code)
 	}
 }
 
-/* Onboard button (sw0): short press opens the 60 s pairing window. A long
- * press (>1.5 s) used to play macro slot 0 (v5); v5.14 removed the macro
- * store for good, so a long press currently does nothing.
+/* Onboard button (sw0). v5.3-v5.8: a short press opened the 60 s pairing
+ * window; v5-v5.13: a long press (>1.5 s) played macro slot 0. Both are
+ * gone in v6.0 (pairing removed; macro store removed in v5.14) — the button
+ * is kept wired (debounced) but does nothing.
  */
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
@@ -269,15 +279,11 @@ static void button_work_handler(struct k_work *work)
 	press_valid = false;
 
 	if (k_uptime_get() - press_start >= LONG_PRESS_MS) {
-		/* v5.14: the standalone macro trigger went away with the macro
-		 * store (removed for good); a long press currently does nothing.
-		 */
-		LOG_INF("Long press ignored (no macro store)");
+		LOG_INF("Long press ignored (no macro store, no pairing)");
 		return;
 	}
 
-	LOG_INF("Button pressed");
-	ble_open_pairing_window();
+	LOG_INF("Button pressed (no action in v6.0)");
 }
 
 static K_WORK_DELAYABLE_DEFINE(button_work, button_work_handler);
@@ -337,7 +343,7 @@ int main(void)
 
 	ret = button_init();
 	if (ret) {
-		LOG_ERR("Button init failed (%d), pairing window unusable", ret);
+		LOG_ERR("Button init failed (%d), continuing without it", ret);
 	}
 
 	ret = usb_kbd_init();

@@ -956,6 +956,123 @@ localStorage macros, and `MacroPanel` keeps its Import/Export
 (`exportMacrosJson`/`parseMacrosImport`). DIS firmware revision is
 `vk-5.14`.
 
+## v6.0: InputStick emulation — packet layer + handshake + keyboard (M2)
+
+v6.0 makes the dongle speak the InputStick packet protocol on top of NUS so
+the free InputStick iOS/Android apps connect, reach "Ready", and type
+(spec: `INPUTSTICK_EMULATION_SPEC.md`). The v2..v5 legacy raw ASCII/escape
+byte stream is gone — the dongle speaks InputStick only.
+
+### Stripped (spec §2/§9.1)
+
+- `bt_conn_set_security(conn, BT_SECURITY_L2)` (v5.7) removed from
+  `connected()`.
+- DisplayYesNo numeric-comparison pairing (v5.8) removed: `auth_cb`
+  (`auth_cancel`/`auth_passkey_display`/`auth_passkey_confirm` +
+  `passkey_confirm_work`), `bt_conn_auth_cb_register()`.
+- Bonded-peer gate + bondless recovery + 60 s pairing window (v5.3)
+  removed: `pairing_window_open`, `peer_is_bonded`/`bond_search`,
+  `bond_count_cb`, `close_pairing_window`/`pairing_window_expired`,
+  `ble_open_pairing_window`, `bt_set_bondable()` toggling, and the
+  `bt_foreach_bond` recovery in `ble_init()`.
+- RX characteristic `BT_GATT_PERM_WRITE_ENCRYPT` → `BT_GATT_PERM_WRITE`.
+- `CONFIG_BT_SMP=y` removed from prj.conf (no security manager → no
+  pairing/bonding/encryption; `CONFIG_MBEDTLS` drops with it).
+- `src/typing.c` removed from the build (the legacy raw stream); the file
+  stays in the tree as a reference.
+- The onboard button now does nothing (its short-press pairing window and
+  long-press macro trigger are both gone).
+
+### Kept (do not regress)
+
+NUS service + `6E400001/2/3` UUIDs, the composite USB HID
+(`usb_kbd_report`/`usb_mouse_report`/`usb_abs_report` + report IDs 1/2/3),
+the v5.4 workqueue-notify rule (all `bt_gatt_notify()` calls deferred off
+the BT RX thread), the boot-stage + connect-stage LED trace, the v5.2 NVS
+mount/repair (`settings_subsys_init()` + `storage_partition_erase()` in
+`ble_init()`), and the v5 ATT MTU headroom
+(`ACL_RX/L2CAP_TX_MTU=200`, `BT_CTLR_DATA_LENGTH_MAX=27`).
+
+### Added: `inputstick.c` (spec §3/§4)
+
+- Byte-wise parser (`inputstick_feed`): scans for `0x55`, reads the header
+  (block count `& 0x3F` + flags), accumulates `blocks*16` payload bytes,
+  verifies CRC32 (`crc32_ieee()`, IEEE 802.3) over `payload[4..end]`.
+- Command dispatch table: `RunFirmware 0x04`, `GetFirmwareInfo 0x10`,
+  `CMD_INIT 0x11`, `SetUpdateInterval 0x31`, `HIDDataKeyboardShort 0x2C`,
+  `HIDDataKeyboard 0x21`, `HIDDataMouse 0x23`, `HIDDataTouchScreen 0x26`,
+  `HIDClear 0x2A`, `HIDRequestStatusReport 0x20`, `Identify 0x01`; anything
+  else responds `RESP_OK (0x01)` when the response flag is set, else is
+  ignored.
+- `is_send`/`is_send_notification`/`is_respond` build packets (CRC + command
+  + param + data, zero-padded to 16) and hand them to `ble_notify()` — a
+  K_MSGQ queue drained by a system-workqueue item, so `bt_gatt_notify()`
+  never runs on the BT RX thread.
+- A dedicated dispatch thread (2048 B) drains the parser's ring buffer so
+  the blocking USB HID submits (and the 5 ms press + 10 ms gap pacing) never
+  stall the BT RX thread.
+
+### Handshake (spec §5 + §9b)
+
+`RunFirmware` → reply `RESP_OK`; `GetFirmwareInfo` → 19-byte firmware-info
+(version 100, no password); `CMD_INIT` (Android) → `RESP_OK`;
+`SetUpdateInterval` → `RESP_OK` when the response flag is set (Android sets
+it, iOS does not), then mark the handshake done. After the handshake, once
+`usb_kbd_ready()`, emit one `HIDStatusNotification` (`data[0]=0x05`
+USBConfigured, `data[11]=0xFF` marker) so the app reaches "Ready". The
+`inputstick_usb_ready()` hook (from `kb_iface_ready`) covers USB enumerating
+after the BLE handshake.
+
+### HID mapping (spec §6)
+
+- `HIDDataKeyboardShort` (2 B `[mods, keycode]`) → **press+release tap**
+  (`usb_kbd_report(mods,key)` → 5 ms hold → `usb_kbd_report(0,0)` → 10 ms
+  gap). This is the dictation path.
+- `HIDDataKeyboard` (8 B) → `usb_kbd_report(mods, key0)` (press; the app
+  sends its own release).
+- `HIDDataMouse` (4 B) → `usb_mouse_report(buttons, dx, dy, wheel)`.
+- `HIDDataTouchScreen` (6 B) → `usb_abs_report(tip, x>>1, y>>1)` (16-bit
+  x/y scaled to 15-bit).
+
+### Deviations / interpretations
+
+1. **Keyboard-short = a tap.** The spec maps keyboard-short to a single
+   `usb_kbd_report(modifiers, keycode)`; that is only the *press* half. A
+   single report would stick the key, so each short report is typed as a
+   press+release (matching the v5 `tap()` semantics and the InputStick
+   "short" form, which is a complete keystroke). The full 8-byte keyboard
+   report keeps the app-managed press/release model.
+2. **Flow control is M3.** Only the one Ready `HIDStatusNotification` is
+   sent; there is no report buffer, drain counter, or periodic (400 ms)
+   status notify yet. A long dictation burst will stop once the app's
+   remote-buffer free-space counter reaches zero — TODO for M3.
+3. **Handshake commands reply unconditionally** (`RunFirmware`,
+   `GetFirmwareInfo`, `CMD_INIT`), not only when the response flag is set,
+   on the assumption the apps always set it for these (spec §5/§9b).
+4. **USB descriptor strings stay "VoiceKB"** — the spec's rename is the BLE
+   advertising/GAP name; the USB product identity is separate and unchanged.
+
+### LED codes (v6.0)
+
+200 ms pulses, distinct from the 60–120 ms RX/HID codes:
+
+| Pattern | Meaning |
+|---|---|
+| 11 blinks (200ms x2) | InputStick packet CRC mismatch |
+| 12 blinks (200ms x3) | InputStick control/handshake packet dispatched |
+| 13 blinks (200ms x4) | handshake done + Ready HIDStatusNotification sent |
+
+Healthy connect: green solid → 9 blinks (TX subscribed) → 12 blinks (per
+handshake packet) → 13 blinks (Ready) → typing.
+
+### Build
+
+DIS firmware revision is `vk-6.0`. Clean build: FLASH 177952 B (30.60%),
+RAM 48528 B (18.51%) — FLASH drops ~40 KB vs v5.14 (SMP + mbedtls gone),
+RAM drops ~11 KB (typing.c's 16 KB ring and the crypto RAM gone; the
+inputstick ring is 8 KB + a 1.1 KB notify queue + the 3 KB dispatch thread).
+UF2 at `build/zephyr/zephyr.uf2`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

@@ -224,6 +224,11 @@ static void kb_iface_ready(const struct device *dev, const bool ready)
 	if (ready) {
 		kb_sent_pulse_done = false;
 		app_led_debug(APP_LED_HID_READY);
+		/* v6.0: if the InputStick handshake already finished, this is
+		 * what finally sends the Ready notification (USB can enumerate
+		 * after the BLE handshake).
+		 */
+		inputstick_usb_ready();
 	}
 }
 
