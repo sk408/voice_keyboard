@@ -4,7 +4,7 @@
  * Single HID interface, one report descriptor with three report IDs:
  *   ID 1 = keyboard (8-byte boot-style input report + LED output report)
  *   ID 2 = mouse (buttons + X/Y/wheel, signed relative int8)
- *   ID 3 = absolute pointer (digitizer-class: buttons + X/Y uint16, 0..32767)
+ *   ID 3 = absolute pointer (buttons + X/Y absolute uint16, 0..32767)
  * The host enumerates one USB device exposing all three functions.
  *
  * Adapted from Zephyr's samples/subsys/usb/hid-keyboard.
@@ -153,18 +153,18 @@ static const uint8_t hid_report_desc[] = {
 		HID_END_COLLECTION,
 	HID_END_COLLECTION,
 	/* Absolute pointer — input report ID 3: 3 buttons, X/Y absolute
-	 * uint16 0..32767 (digitizer-class; the host maps the logical
-	 * extent linearly to the screen).
+	 * uint16 0..32767. A Generic Desktop Pointer collection with absolute
+	 * X/Y (the standard "absolute mouse"/tablet shape, as in QEMU's
+	 * usb-tablet): the host maps the logical extent linearly to the
+	 * screen (no pointer acceleration) and button usages 1..3 ride as
+	 * left/middle/right exactly like the relative mouse above.
 	 */
-	/* HID Usage Page (Digitizer 0x0D) — no Zephyr constant */
-	HID_USAGE_PAGE(0x0D),
-	/* HID_USAGE(Touch Screen 0x04) */
-	HID_USAGE(0x04),
+	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_POINTER),
 	HID_COLLECTION(HID_COLLECTION_APPLICATION),
 		HID_REPORT_ID(VKB_REPORT_ID_ABS),
-		/* HID_USAGE(Finger 0x22) */
-		HID_USAGE(0x22),
-		HID_COLLECTION(HID_COLLECTION_LOGICAL),
+		HID_USAGE(HID_USAGE_GEN_DESKTOP_POINTER),
+		HID_COLLECTION(HID_COLLECTION_PHYSICAL),
 			/* Bits used for button signalling */
 			HID_USAGE_PAGE(HID_USAGE_GEN_BUTTON),
 			HID_USAGE_MIN8(1),

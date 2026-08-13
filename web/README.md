@@ -115,8 +115,8 @@ model:
   - **Absolute pointer** (default): the pad maps to the whole screen through
     the calibration map — the cursor tracks your finger like a tablet, and
     lifting + re-touching jumps the cursor (no deltas). Sent as `0x91`
-    absolute packets (HID report ID 3, digitizer class). Windows maps the
-    absolute digitizer's logical extent **linearly** to the screen — no
+    absolute packets (HID report ID 3, pointer class). Windows maps the
+    absolute pointer's logical extent **linearly** to the screen — no
     pointer acceleration applies.
   - **Classic relative**: ordinary touchpad deltas (`0x90` packets).
 - **Two fingers** always give classic relative deltas, in either mode.

@@ -220,8 +220,8 @@ export default function MousePad() {
   const pressButton = (bit: number, down: boolean) => {
     if (!connected) return;
     heldButtons.current = down ? heldButtons.current | bit : heldButtons.current & ~bit;
-    // Button state must ride in the same report type as the movement: a
-    // digitizer (0x91) drag-select only sees buttons carried by 0x91 packets.
+    // Button state must ride in the same report type as the movement: an
+    // absolute-pointer (0x91) drag-select only sees buttons carried by 0x91 packets.
     const abs = lastAbs.current ?? useAppStore.getState().lastAbsolute;
     if (modeRef.current === 'absolute' && abs) {
       lastAbs.current = abs;

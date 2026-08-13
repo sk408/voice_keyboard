@@ -23,7 +23,7 @@ Standard NUS UUIDs so generic BLE UART libraries/apps work out of the box:
 | RX (central→dongle) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write-no-resp | keystroke payload |
 | TX (dongle→central) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | status bytes |
 
-Also standard DIS (0x180A) with Firmware Revision String = `vk-5.6`.
+Also standard DIS (0x180A) with Firmware Revision String = `vk-5.9`.
 
 ## GATT — config characteristic (v3, REMOVED in v5.5)
 
@@ -105,7 +105,7 @@ Any client connects and reads the same library.
 - **Mouse** (requires the composite HID descriptor; keyboard = report ID 1, mouse = report ID 2):
   - `0x00 0x90 <buttons> <dx> <dy> <wheel>` — buttons bit0 left/bit1 right/bit2 middle;
     dx, dy, wheel = signed int8 relative movement. Sent at touch-event rate; firmware clamps per-report deltas to int8 range.
-- **Absolute pointer** (report ID 3, digitizer-class; Windows maps logical extent linearly to the screen — no pointer acceleration):
+- **Absolute pointer** (report ID 3, pointer-class with absolute X/Y; Windows maps logical extent linearly to the screen — no pointer acceleration):
   - `0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo> <y_hi>` — buttons as above; x, y = uint16 LE, 0..32767 normalized screen position.
   - Intended use: teleport/landmark clicks, drag-select with exact endpoints, tablet-style tracking.
     Calibration: verify-first (teleport to corners, user confirms); four-corner learn mode is the fallback for odd monitor mappings.

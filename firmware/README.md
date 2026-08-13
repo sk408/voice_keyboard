@@ -44,7 +44,7 @@ are not migrated — re-pair once.
   keyboard = input report ID 1 (8-byte report + ID byte, mods + 6-key
   array + LED output report), mouse = input report ID 2 (buttons +
   X/Y/wheel signed int8 + ID byte), absolute pointer = input report ID 3
-  (digitizer-class: buttons + X/Y absolute uint16, logical 0..32767 + ID
+  (absolute-pointer class: buttons + X/Y absolute uint16, logical 0..32767 + ID
   byte). Windows enumerates one USB device exposing all three functions;
   the absolute pointer maps linearly to the screen with no pointer
   acceleration. Because the descriptor uses report
@@ -54,7 +54,7 @@ are not migrated — re-pair once.
   user-settable name was removed in v5.5, see DEBUG_NOTES.md) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-5.8`.
+  bytes). DIS firmware revision string: `vk-5.9`.
 - **Macro store (v5) — removed in v5.6**: the MACRO_LIST/MACRO_RW
   characteristics, the flash-backed macro store, and the standalone
   long-press macro trigger never worked on hardware and caused every v5.x
@@ -80,8 +80,8 @@ are not migrated — re-pair once.
   clamped to the descriptor range −127..127. Mouse packets bypass the
   keystroke rate limit.
 - **Absolute pointer (v4)**: `0x00 0x91 <buttons> <x_lo> <x_hi> <y_lo>
-  <y_hi>` emits an absolute pointer report (report ID 3, digitizer-class
-  Touch Screen application collection); buttons as for the mouse, x/y =
+  <y_hi>` emits an absolute pointer report (report ID 3, a Generic Desktop
+  Pointer with absolute X/Y); buttons as for the mouse, x/y =
   uint16 LE 0..32767 normalized screen position. Absolute pointer packets
   bypass the keystroke rate limit.
 - **Status**: TX notifies `0x01` (busy) while the keystroke queue is being

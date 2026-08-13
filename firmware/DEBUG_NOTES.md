@@ -606,6 +606,57 @@ central, not a desktop browser.
 
 DIS firmware revision is `vk-5.8`.
 
+## v5.9: absolute pointer (report ID 3) dead on the host — digitizer descriptor rejected
+
+Hardware symptom (user-reported): typing and pairing work, but everything
+routed through the absolute pointer is dead — one-finger drag does not move
+the cursor, the left/middle/right buttons do nothing in absolute mode (they
+work in relative mode), and the calibration wizard cannot teleport the
+cursor. Relative mouse (report ID 2) and scroll keep working.
+
+Root cause: the v4 absolute pointer collection was declared as a **digitizer
+Touch Screen** (`usage page 0x0D`, `usage 0x04 Touch Screen`, `Finger 0x22`
+logical collection). Windows only accepts a touch digitizer when the contact
+collection carries the mandatory usages — **Tip Switch (0x42)**, Contact
+Identifier (0x51), and the top-level Contact Count (0x54) (see Microsoft's
+"Sample Report Descriptors" for Windows Touchscreen). The descriptor here had
+none of them, so the HID digitizer consumer never registered a contact and
+dropped every report ID 3 input — no movement, no buttons, no teleport. It
+is the same "touchscreen" flavor Microsoft warns about: even a correctly
+populated touch collection hides the pointer until a touch, which is wrong
+for a drawing-tablet cursor that must track the finger continuously.
+
+Fix (`usb_kbd.c`): reclassify report ID 3 from the digitizer Touch Screen to
+a **Generic Desktop Pointer with absolute X/Y** — the standard "absolute
+mouse"/tablet shape used by QEMU's `usb-tablet`:
+
+```
+Usage Page (Generic Desktop)
+Usage (Pointer)
+Collection (Application)
+  Report ID (3)
+  Usage (Pointer)
+  Collection (Physical)
+    Usage Page (Button), Usage Min 1, Max 3   // left/middle/right
+    ...3 button bits + 5 padding...
+    Usage Page (Generic Desktop), Usage X, Usage Y
+    Logical 0..32767, 16-bit absolute X/Y
+```
+
+The report layout is unchanged — report ID byte + 1 button byte + 4 X/Y
+bytes = the same 6-byte `AB_REPORT_COUNT` — so `usb_abs_report()`, the
+`0x00 0x91` parser in `typing.c`, and the web app's `encodeAbsolute()` all
+stay byte-identical. Windows maps a Pointer's absolute extent linearly to
+the screen (no pointer acceleration) and button usages 1..3 to
+left/middle/right exactly like the relative mouse, which is why the on-screen
+buttons now work in both modes and the calibration teleport works.
+
+Net change is the report descriptor only (`hid_report_desc` in
+`usb_kbd.c`); no firmware parsing, report-buffer, or web-protocol changes.
+Keyboard (ID 1) and relative mouse (ID 2) collections are untouched.
+
+DIS firmware revision is `vk-5.9`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

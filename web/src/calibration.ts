@@ -2,7 +2,7 @@
  * Calibration mapping between actual-screen fractions (fx, fy in 0..1,
  * origin top-left) and the normalized 0..32767 coordinates sent on the wire
  * (PROTOCOL.md v4 "Absolute pointer"). Needed when Windows spans the
- * digitizer's logical extent over a virtual desktop larger than the target
+ * pointer's logical extent over a virtual desktop larger than the target
  * screen. Persisted per device in localStorage.
  *
  * Pure module — DOM-free except for localStorage; unit-tested in
