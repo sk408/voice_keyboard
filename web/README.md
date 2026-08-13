@@ -107,26 +107,26 @@ into the manager; localStorage is only a read-through cache. Details:
 
 ### Mouse tab
 
-The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v4 gesture
-model:
+The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v5.10
+gesture model:
 
 - **One finger** uses the configured one-finger mode (Settings → One-finger
   trackpad mode):
   - **Absolute pointer** (default): the pad maps to the whole screen through
     the calibration map — the cursor tracks your finger like a tablet, and
     lifting + re-touching jumps the cursor (no deltas). Sent as `0x91`
-    absolute packets (HID report ID 3, pointer class). Windows maps the
-    absolute pointer's logical extent **linearly** to the screen — no
-    pointer acceleration applies.
+    absolute packets (HID report ID 3, pointer class) with a constant button
+    byte of 0. Windows maps the absolute pointer's logical extent
+    **linearly** to the screen — no pointer acceleration applies.
   - **Classic relative**: ordinary touchpad deltas (`0x90` packets).
-- **Two fingers** always give classic relative deltas, in either mode.
-- **Tap** = left click, **two-finger tap** = right click. In absolute mode a
-  tap clicks at the tapped spot (press + release `0x91` at that position).
+- **Two fingers** always give classic relative deltas ("fine control") from
+  the cursor's current position, in either mode — the second finger never
+  triggers an absolute jump.
 - **Scroll strip** (right edge): vertical drag = scroll wheel, natural
   direction (drag up = scroll up).
-- **Left / Middle / Right** on-screen buttons are hold-to-press; the held set
-  rides in every packet (both `0x90` and `0x91`), so hold Left while dragging
-  for drag-select in either mode.
+- **Left / Middle / Right** on-screen buttons are hold-to-press and click
+  through the relative mouse (`0x90`); the trackpad itself never clicks, so
+  the absolute pointer (0x91) button byte stays 0.
 
 All pointer packets are throttled to ~50/s. Switching tabs is pure view
 state — the BLE connection is owned by the store and is never torn down.

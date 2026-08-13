@@ -23,7 +23,7 @@ Standard NUS UUIDs so generic BLE UART libraries/apps work out of the box:
 | RX (central→dongle) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | write, write-no-resp | keystroke payload |
 | TX (dongle→central) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | notify | status bytes |
 
-Also standard DIS (0x180A) with Firmware Revision String = `vk-5.9`.
+Also standard DIS (0x180A) with Firmware Revision String = `vk-5.10`.
 
 ## GATT — config characteristic (v3, REMOVED in v5.5)
 

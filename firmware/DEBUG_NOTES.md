@@ -657,6 +657,43 @@ Keyboard (ID 1) and relative mouse (ID 2) collections are untouched.
 
 DIS firmware revision is `vk-5.9`.
 
+## v5.10: touchpad drops its clicks; two-finger push is fine control from the cursor
+
+User-requested feel change, web app only — no firmware or protocol byte
+change.
+
+1. Remove the touchpad's clicks. In `web/src/components/MousePad.tsx` the
+   touchpad asserted buttons three ways: a tap sent a left click (two-finger
+   tap a right click) via `tapClick()`; the on-screen buttons put their bit
+   through the absolute pointer (`pressButton()` sent `0x00 0x91` with a
+   non-zero button byte); and `flush()` carried `heldButtons` in every 0x91
+   movement packet so hold-Left-drag became an absolute drag-select. All
+   three are gone: tap detection (`tapClick`, the `gesture` bookkeeping,
+   `TAP_SLOP_PX`/`TAP_TIME_MS`) is removed; `flush()` sends the absolute
+   pointer with a constant button byte of 0; and `pressButton()` routes
+   clicks through the relative mouse (0x90). The absolute pointer (report
+   ID 3) is now a pure pointing surface, while the on-screen buttons still
+   click via the relative mouse. Landmark "teleport + click" and the
+   calibration wizard are untouched — they call `sendAbsolute()` with their
+   own button bytes, which the firmware still forwards.
+
+2. Two-finger push enters fine control without an absolute jump. The first
+   finger's `onPointerDown` used to `queueAbsolute()` immediately, so the
+   cursor jumped to the first finger's position before the second finger
+   landed and the gesture switched to relative deltas. The jump is gone:
+   `onPointerDown` no longer queues an absolute move — the cursor only moves
+   on a single-finger `onPointerMove` — and when the second finger lands any
+   absolute move the first finger had already queued is discarded
+   (`pendingAbs.current = null`). A two-finger drag now drives classic
+   relative deltas straight from wherever the cursor already is.
+
+Net change is `web/src/components/MousePad.tsx` only. `typing.c`'s 0x91
+parser, `usb_abs_report()`, and the report descriptor are untouched; the
+relative mouse (ID 2), scroll, keyboard (ID 1), and the v5.9 absolute-pointer
+descriptor all keep working.
+
+DIS firmware revision is `vk-5.10`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.
