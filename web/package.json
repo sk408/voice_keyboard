@@ -1,7 +1,7 @@
 {
   "name": "voice-keyboard-web",
   "private": true,
-  "version": "1.0.0",
+  "version": "5.11.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

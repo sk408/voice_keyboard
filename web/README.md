@@ -107,7 +107,7 @@ into the manager; localStorage is only a read-through cache. Details:
 
 ### Mouse tab
 
-The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v5.10
+The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v5.11
 gesture model:
 
 - **One finger** uses the configured one-finger mode (Settings → One-finger
@@ -121,7 +121,9 @@ gesture model:
   - **Classic relative**: ordinary touchpad deltas (`0x90` packets).
 - **Two fingers** always give classic relative deltas ("fine control") from
   the cursor's current position, in either mode — the second finger never
-  triggers an absolute jump.
+  triggers an absolute jump, and lifting one finger of the pair keeps the
+  gesture relative until the other lifts too, so disengaging never moves
+  the cursor.
 - **Scroll strip** (right edge): vertical drag = scroll wheel, natural
   direction (drag up = scroll up).
 - **Left / Middle / Right** on-screen buttons are hold-to-press and click

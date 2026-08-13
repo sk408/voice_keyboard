@@ -54,7 +54,7 @@ are not migrated — re-pair once.
   user-settable name was removed in v5.5, see DEBUG_NOTES.md) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-5.10`.
+  bytes). DIS firmware revision string: `vk-5.11`.
 - **Macro store (v5) — removed in v5.6**: the MACRO_LIST/MACRO_RW
   characteristics, the flash-backed macro store, and the standalone
   long-press macro trigger never worked on hardware and caused every v5.x

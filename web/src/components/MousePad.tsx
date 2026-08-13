@@ -6,14 +6,16 @@ import { screenFractionToNorm } from '../calibration';
 /**
  * Mouse tab: a full-width trackpad plus on-screen buttons and a scroll strip.
  *
- * v5.10 gesture model:
+ * v5.11 gesture model:
  * - one-finger drag  → the configured one-finger mode:
  *     · absolute (default): the pad maps to the whole screen through the
  *       calibration map; the cursor tracks the finger (0x91 packets)
  *     · relative: classic deltas (0x90 dx/dy)
  * - two-finger drag  → classic relative deltas ("fine control") from the
  *                      cursor's current position, in either mode — the
- *                      second finger never triggers an absolute jump
+ *                      second finger never triggers an absolute jump, and
+ *                      lifting one finger of the pair keeps the gesture
+ *                      relative until the other lifts too (no disengage jump)
  * - scroll strip     → vertical drag = wheel (natural direction: up = up)
  * - buttons below    → hold-to-press left/middle/right via the relative
  *                      mouse (0x90); the touchpad itself never clicks, so the
@@ -49,6 +51,13 @@ export default function MousePad() {
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   /** Pointer whose deltas drive relative moves (first finger down). */
   const anchorId = useRef<number | null>(null);
+  /**
+   * True from the moment a second finger lands until every finger lifts.
+   * Keeps the tail of a two-finger gesture in relative mode so the last
+   * finger lifting can't briefly re-enter absolute pointing and teleport
+   * the cursor to its position (v5.11 disengage fix).
+   */
+  const multiFinger = useRef(false);
   /** Accumulated relative deltas awaiting the next flush. */
   const pending = useRef({ dx: 0, dy: 0, wheel: 0 });
   /** Latest absolute position awaiting the next flush (null = nothing new). */
@@ -119,6 +128,9 @@ export default function MousePad() {
       // Second finger landed: discard any absolute move the first finger
       // queued before this became two-finger fine control.
       pendingAbs.current = null;
+      // From here the gesture stays relative until every finger lifts, so
+      // a lone remaining finger can't re-enter absolute pointing (v5.11).
+      multiFinger.current = true;
     }
     startFlush();
   };
@@ -130,9 +142,10 @@ export default function MousePad() {
     const dy = e.clientY - prev.y;
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    if (pointers.current.size >= 2 || modeRef.current === 'relative') {
-      // Relative path: two fingers always mean classic deltas, in either
-      // one-finger mode. Only the anchor pointer drives movement.
+    if (multiFinger.current || modeRef.current === 'relative') {
+      // Relative path: two fingers (or the tail of a two-finger gesture)
+      // always mean classic deltas, in either one-finger mode. Only the
+      // anchor pointer drives movement.
       if (e.pointerId === anchorId.current) {
         const p = pending.current;
         p.dx += dx * SENSITIVITY;
@@ -152,6 +165,7 @@ export default function MousePad() {
       anchorId.current = next.done ? null : next.value;
     }
     if (pointers.current.size > 0) return;
+    multiFinger.current = false;
     stopFlush();
   };
 

@@ -694,6 +694,38 @@ descriptor all keep working.
 
 DIS firmware revision is `vk-5.10`.
 
+## v5.11: two-finger disengage jumps the cursor — the up transition hole
+
+The v5.10 down-transition fix closed one side of the two-finger gesture and
+left the other open. v5.10 made the second finger landing discard any queued
+absolute move (`pendingAbs.current = null`) so a two-finger push enters fine
+control straight from the cursor's current position. But `onPointerMove`
+routed on `pointers.current.size >= 2`, so the *disengage* had the mirror
+bug: when the user lifts one finger to end the gesture, the remaining finger
+is momentarily the only contact, `pointers.current.size` drops to 1, and the
+next move event on that finger takes the absolute branch —
+`queueAbsolute()` — teleporting the cursor to the finger's pad position for
+the split second before it too lifts. Exactly the reported jump: *"when i
+try to disengage my two fingers, it reads that one finger for the split
+second i'm trying to raise both, and the cursor jumps to where that last
+finger is touching."*
+
+Fix (`web/src/components/MousePad.tsx`, web app only): a `multiFinger` ref is
+set the moment a second finger lands and only cleared when **every** finger
+lifts. `onPointerMove` routes on `multiFinger.current` (instead of
+`pointers.current.size >= 2`), so the tail of a two-finger gesture — the
+lone remaining finger — stays in the relative path and drives classic
+deltas from the cursor's current position instead of re-entering absolute
+pointing. The anchor is already re-assigned in `onPointerUp`, so the
+remaining finger continues fine control with no teleport, and disengaging
+moves the cursor at most by the finger's own tiny relative drift, not a
+jump.
+
+Net change is `web/src/components/MousePad.tsx` only; the 0x91/0x90 packet
+formats, the firmware parser, and the report descriptor are untouched.
+Scroll and the relative mouse are unaffected. DIS firmware revision is
+`vk-5.11`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.
