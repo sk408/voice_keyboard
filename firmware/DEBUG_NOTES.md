@@ -451,6 +451,60 @@ failure is caught (`config = null`, `supportsDeviceName` false, rename UI
 hidden, `refreshDeviceName` no-ops) — verified in `web/src/ble.ts` and
 `web/src/store.ts`. DIS firmware revision is `vk-5.5`.
 
+## v5.6: v5 macro store stripped — bisect back to the known-good v2 core
+
+Hardware observation on v5.5: connect reaches 9 blinks (TX subscribed),
+then 10 blinks (MACRO_LIST read entered, first encrypted GATT read), then
+the dongle goes unresponsive — link up, ATT dead. Same hang class as every
+v5.x iteration. The macro store characteristics are the only remaining
+delta from the v2 core that never worked on hardware, so they are **removed
+outright** as a deliberate bisect: prove the clean core, re-add macros
+incrementally later.
+
+Removed:
+
+- MACRO_LIST characteristic (declaration, value, CCC) and `macro_list_read`.
+- MACRO_RW characteristic and `macro_rw_read` / `macro_rw_write`.
+- `ble_notify_macro_list()` + `macro_list_notify_work` in ble.c.
+- `macro.c` excluded from the build (CMakeLists); the file stays in the
+  tree as the reference for the re-add. Its entry points are gone with it:
+  no `macro_boot_finalize()` after `settings_load()`, no `macro_abort_put()`
+  on disconnect, no button → `macro_play()` (a long press now just logs).
+- vkb.h macro declarations and `VKB_TX_ERR_STORE_FULL` (0xE1) removed.
+
+Kept (do not regress): v2 composite HID core (kbd+mouse+abs pointer,
+sticky modifiers, trackpad, all typing/pointer layers), v5.4 deferred
+workqueue notifications (never `bt_gatt_notify()` on the BT RX thread),
+v5.3 bondless recovery (60 s self-opened pairing window with zero stored
+bonds), v5.2 NVS mount/repair before `bt_enable()`, connect-stage LED
+trace, hard-fault blink. The nus_svc table is back to 6 attributes
+(`attrs[0..5]`); the TX status notify target (`attrs[2]`) is unchanged.
+The v5 ATT MTU headroom (`ACL_RX/L2CAP_TX_MTU=200`,
+`BT_CTLR_DATA_LENGTH_MAX=27` pin) is kept so the on-air link stays
+byte-identical to the v5.x builds.
+
+The 10th connect-stage blink has no trigger anymore (it fired from the
+MACRO_LIST read handler, and no app-level encrypted read remains); the
+enum/`main.c` case are retained. The trace now ends at 9 blinks = TX
+subscribed.
+
+**For the future re-add** (strong hypothesis for the v5.5 hang): the stall
+was in `macro_list_read` → `macro_list_json()` →
+`k_mutex_lock(&store_lock, K_FOREVER)` on the BT RX thread — `store_lock`
+was most likely leaked (locked but never released) by
+`macro_boot_finalize()` or another path, so the first GATT read that took
+the lock blocked the RX thread forever. Audit every `store_lock` critical
+section for early-return leaks before re-exposing any macro GATT read.
+
+To re-add macros: restore the `src/macro.c` line in CMakeLists.txt, the
+macro block + `ble_notify_macro_list()` in vkb.h, and the GATT surface in
+ble.c — all recoverable from git history (v5.5, da3541e).
+
+Web side needs no change (verified): `web/src/ble.ts` catches the absent
+MACRO_LIST/MACRO_RW `getCharacteristic()` calls (`macroList`/`macroRw` =
+null → `supportsMacroStore` false) and `web/src/store.ts` falls back to
+localStorage macros. DIS firmware revision is `vk-5.6`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.

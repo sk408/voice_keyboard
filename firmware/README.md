@@ -54,55 +54,15 @@ are not migrated — re-pair once.
   user-settable name was removed in v5.5, see DEBUG_NOTES.md) with
   the NUS service UUID (`6E400001-...`). RX `6E400002-...` (write /
   write-no-resp, encrypted link required), TX `6E400003-...` (notify, status
-  bytes). DIS firmware revision string: `vk-5.5`.
-- **Macro store characteristics (v5)**: two more vendor characteristics on
-  the same service, both encrypted-link only:
-  - MACRO_LIST `5A1B0002-8C4D-4E2F-9A3B-7C6D5E4F3A2B` (read + notify):
-    JSON array of the stored macros, e.g.
-    `[{"i":0,"name":"SOAP note","len":412}]` (`[]` when empty). A notify is
-    sent whenever the store changes (put/del completes). Best effort: if the
-    list outgrows the negotiated ATT MTU the notification is dropped — the
-    full value can always be read from the characteristic.
-  - MACRO_RW `5A1B0003-8C4D-4E2F-9A3B-7C6D5E4F3A2B` (write-with-response +
-    read), chunked transfer:
-    - Write `{"op":"put","i":0,"name":"...","off":0,"data":"..."}` — each
-      ATT write carries ≤180 bytes of payload; `off` is the cumulative byte
-      offset into the template; the final chunk adds `"fin":true`. `name`
-      is only required on the first chunk (`off`=0). A new `off`=0 chunk
-      restarts an interrupted put; a disconnect aborts it (staging
-      discarded).
-    - Write `{"op":"del","i":2}` deletes slot 2 (deleting an empty slot is
-      a no-op).
-    - Write `{"op":"get","i":0,"off":412}` prepares a read chunk; reading
-      MACRO_RW then returns
-      `{"op":"get","i":0,"off":412,"len":TOTAL,"data":"..."}` plus
-      `"fin":true` when the chunk reaches the end. Responses are capped at
-      180 bytes (a read with no preceding get returns `{}`).
-  - JSON `data` encoding (client contract): the template is an arbitrary
-    byte stream (UTF-8 text + pre-encoded `0x00` escape tokens). Printable
-    safe ASCII passes through; every other byte — control bytes incl. the
-    `0x00` escape marker, and bytes ≥0x80 — is encoded as one `\u00XX`
-    escape per raw byte (uppercase hex), plus the standard JSON escapes
-    `\"` and `\\`. The result is strict JSON in both directions (the
-    firmware's get responses use the same encoding). Chunk boundaries may
-    fall anywhere in the byte stream (mid-UTF-8 character,
-    mid-escape-sequence): the firmware unescapes each chunk at the byte
-    level and appends the raw bytes, never interpreting UTF-8.
-  - Capacity: 16 slots (indices 0–15), name ≤24 bytes each, 16 KB total
-    store budget. A put that would exceed the budget is rejected: the write
-    fails with an ATT error and error notify `0xE1` is sent on the NUS TX
-    characteristic. An empty template (`fin` with no data) deletes the slot.
-  - Persistence: settings/NVS under `vkbm/<i>/n` (name) and
-    `vkbm/<i>/t/<k>` (template chunks of 2 KB — one NVS record must fit a
-    4 KB flash sector). Chunks are validated and reassembled at boot;
-    a partial/corrupt set (e.g. power loss mid-commit) drops the slot.
-- **Macro playback (v5)**: playing a stored macro feeds its template bytes
-  through the same typing-engine path as NUS RX bytes — tokens/escapes are
-  stored pre-encoded by the client, the dongle just types the byte stream.
-  **Standalone trigger**: a long press (>1.5 s) of the dongle button while
-  no BLE connection is active plays macro slot 0 over USB. Short press
-  remains the 60 s pairing window (unchanged, also while connected). If
-  slot 0 is empty, a long press does nothing.
+  bytes). DIS firmware revision string: `vk-5.6`.
+- **Macro store (v5) — removed in v5.6**: the MACRO_LIST/MACRO_RW
+  characteristics, the flash-backed macro store, and the standalone
+  long-press macro trigger never worked on hardware and caused every v5.x
+  connect hang, so they were stripped as a deliberate bisect back to the
+  v2 core (see DEBUG_NOTES.md v5.6). `macro.c` stays in the tree but is
+  excluded from the build; the protocol documentation lives in git history
+  (v5.5, da3541e) for the planned incremental re-add. A long button press
+  now does nothing; short press remains the 60 s pairing window.
 - **Typing**: RX bytes are reassembled as a byte stream (robust to any BLE
   chunking, including escape sequences split across chunk boundaries) and
   typed on a US layout at ~15 ms/keystroke. Shift handling for
@@ -130,7 +90,7 @@ are not migrated — re-pair once.
   Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
   report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
   interface ready, 4 = mouse packet received, 5 = absolute pointer packet
-  received, 6 = macro playback started. At boot the red LED also runs a
+  received (6 = macro playback started, v5 only — unused since v5.6). At boot the red LED also runs a
   stage trace (1→5 blinks in slow groups: main, USB up, BLE up, settings
   loaded, advertising up) — the last group seen pinpoints a boot hang.
   Long (400 ms) blinks are boot sub-stages on the bt_enable() path, and

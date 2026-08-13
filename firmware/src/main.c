@@ -50,7 +50,7 @@ static void dbg_led_work_handler(struct k_work *work)
  * boot hang on the headless dongle is pinpointed by the last code seen.
  * Codes (execution order, documented in DEBUG_NOTES.md):
  *   1 = main() entered, 2 = USB HID up, 3 = BLE stack up (bt_enable),
- *   4 = settings loaded (incl. macro store restore), 5 = advertising up.
+ *   4 = settings loaded, 5 = advertising up.
  * No blinks at all = death before main() (kernel/driver init).
  */
 void app_boot_stage(uint8_t stage)
@@ -198,8 +198,9 @@ void app_led_debug(enum app_led_code code)
 	}
 }
 
-/* Onboard button (sw0): short press opens the 60 s pairing window; long
- * press (>1.5 s) with no BLE connection plays macro slot 0 over USB (v5).
+/* Onboard button (sw0): short press opens the 60 s pairing window. A long
+ * press (>1.5 s) used to play macro slot 0 (v5); v5.6 stripped the macro
+ * store, so a long press currently does nothing.
  */
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
@@ -268,15 +269,10 @@ static void button_work_handler(struct k_work *work)
 	press_valid = false;
 
 	if (k_uptime_get() - press_start >= LONG_PRESS_MS) {
-		/* Long press: standalone macro trigger, only while no central
-		 * is connected (macro_play is a no-op when slot 0 is empty).
+		/* v5.6: the standalone macro trigger went away with the macro
+		 * store (bisect); a long press currently does nothing.
 		 */
-		if (!ble_is_connected()) {
-			LOG_INF("Long press: playing macro 0");
-			macro_play(0);
-		} else {
-			LOG_INF("Long press ignored (BLE connected)");
-		}
+		LOG_INF("Long press ignored (no macro store)");
 		return;
 	}
 

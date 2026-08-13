@@ -10,5 +10,7 @@ target_sources(app PRIVATE
   src/usb_kbd.c
   src/ble.c
   src/typing.c
-  src/macro.c
+  # v5.6: src/macro.c (v5 macro store) excluded — the macro GATT surface
+  # hung every v5.x build on hardware; re-add incrementally later
+  # (see DEBUG_NOTES.md v5.6 for what to restore).
 )
