@@ -50,6 +50,14 @@ int usb_kbd_report(uint8_t mods, uint8_t key);
 int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel);
 /* Submit one absolute pointer report (report ID 3). x/y: 0..32767. */
 int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y);
+/* Submit one consumer-control report (report ID 4): a 16-bit consumer
+ * usage (media key). */
+int usb_consumer_report(uint16_t usage);
+/* Read and reset the per-interface "reports sent to host" drain counters
+ * (keyboard / mouse / consumer). The absolute pointer and consumer-control
+ * submits both count into the consumer figure (InputStick "consumer
+ * queue"). Used by the periodic HIDStatusNotification. */
+void usb_hid_drain_counts(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer);
 
 /* --- BLE NUS peripheral (ble.c) --- */
 int ble_init(void);

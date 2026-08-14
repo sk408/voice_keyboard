@@ -20,6 +20,7 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/sys/util.h>
 
 #include <string.h>
 
@@ -174,6 +175,12 @@ BT_CONN_CB_DEFINE(conn_cbs) = {
  */
 
 #define BLE_NOTIFY_MAX_LEN	274 /* 2 (tag+hdr) + 272 (max payload) */
+/* The peer never negotiates ATT MTU, so it stays 23 = a 20-byte notification
+ * payload. Zephyr drops any ATT PDU with len + 1 > MTU, so every packet is
+ * split into <=20-byte notifications (the peer's PacketReader reassembles
+ * the byte stream, so chunk boundaries are arbitrary).
+ */
+#define BLE_NOTIFY_CHUNK	20
 
 struct ble_notify_msg {
 	uint16_t len;
@@ -193,11 +200,19 @@ static void notify_work_fn(struct k_work *work)
 			continue;
 		}
 
-		int err = bt_gatt_notify(current_conn, &nus_svc.attrs[2],
-					 msg.data, msg.len);
+		/* Chunk the packet into <=20-byte notifies (see
+		 * BLE_NOTIFY_CHUNK): the whole InputStick packet must be
+		 * emitted in order, but the chunk boundaries are arbitrary.
+		 */
+		for (uint16_t off = 0; off < msg.len; off += BLE_NOTIFY_CHUNK) {
+			uint16_t chunk = MIN(msg.len - off, BLE_NOTIFY_CHUNK);
+			int err = bt_gatt_notify(current_conn,
+						 &nus_svc.attrs[2],
+						 msg.data + off, chunk);
 
-		if (err) {
-			LOG_WRN("Notify failed (%d)", err);
+			if (err) {
+				LOG_WRN("Notify failed (%d)", err);
+			}
 		}
 	}
 }

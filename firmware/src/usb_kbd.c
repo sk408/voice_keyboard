@@ -34,6 +34,7 @@ LOG_MODULE_REGISTER(usb_kbd, LOG_LEVEL_INF);
 #define VKB_REPORT_ID_KBD	1
 #define VKB_REPORT_ID_MOUSE	2
 #define VKB_REPORT_ID_ABS	3
+#define VKB_REPORT_ID_CONSUMER	4
 
 enum kb_report_idx {
 	KB_REPORT_ID_IDX = 0,
@@ -60,6 +61,13 @@ enum ab_report_idx {
 	AB_Y_LO,
 	AB_Y_HI,
 	AB_REPORT_COUNT = 6, /* report ID byte + 5-byte absolute pointer report */
+};
+
+enum consumer_report_idx {
+	CONSUMER_REPORT_ID_IDX = 0,
+	CONSUMER_USAGE_LO,
+	CONSUMER_USAGE_HI,
+	CONSUMER_REPORT_COUNT = 3, /* report ID byte + 16-bit usage */
 };
 
 /*
@@ -192,6 +200,27 @@ static const uint8_t hid_report_desc[] = {
 			HID_INPUT(0x02),
 		HID_END_COLLECTION,
 	HID_END_COLLECTION,
+	/* Consumer Control — input report ID 4: a single 16-bit consumer
+	 * usage (media keys: Play/Pause 0xCD, Vol+ 0xE9, Vol- 0xEA,
+	 * Mute 0xE2, next 0xB5, prev 0xB6, …). Usage page 0x0C (Consumer),
+	 * usage 0x01 (Consumer Control). The 16-bit field is an array over
+	 * the full 0..0xFFFF usage range so the host maps the reported value
+	 * straight to the consumer/media key. Report = ID byte + 2 data
+	 * bytes = 3 bytes (must match CONSUMER_REPORT_COUNT exactly).
+	 */
+	HID_USAGE_PAGE(0x0C),
+	HID_USAGE(0x01),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+		HID_REPORT_ID(VKB_REPORT_ID_CONSUMER),
+		HID_USAGE_MIN16(0, 0),
+		HID_USAGE_MAX16(0xFF, 0xFF),
+		HID_LOGICAL_MIN16(0, 0),
+		HID_LOGICAL_MAX16(0xFF, 0xFF),
+		HID_REPORT_SIZE(16),
+		HID_REPORT_COUNT(1),
+		/* HID_INPUT (Data,Array,Abs) */
+		HID_INPUT(0x00),
+	HID_END_COLLECTION,
 };
 
 static const struct device *hid_dev =
@@ -210,6 +239,19 @@ static const struct device *hid_dev =
 UDC_STATIC_BUF_DEFINE(kb_report, KB_REPORT_COUNT);
 UDC_STATIC_BUF_DEFINE(ms_report, MS_REPORT_COUNT);
 UDC_STATIC_BUF_DEFINE(ab_report, AB_REPORT_COUNT);
+UDC_STATIC_BUF_DEFINE(consumer_report, CONSUMER_REPORT_COUNT);
+
+/* Per-interface "reports sent to host" drain counters, incremented on each
+ * successful synchronous HID submit (a success means the host clocked the
+ * report off the interrupt IN endpoint). Read+reset atomically by the
+ * periodic HIDStatusNotification via usb_hid_drain_counts(). The absolute
+ * pointer (touchscreen) and consumer-control reports both count into the
+ * consumer drain figure, matching InputStick's "touchscreen rides the
+ * consumer queue" model (status byte [9] = consumer reports sent).
+ */
+static atomic_t kbd_sent;
+static atomic_t mouse_sent;
+static atomic_t consumer_sent;
 
 /* Written by the USBD thread, read by the typing thread. */
 static atomic_t kb_ready;
@@ -265,6 +307,10 @@ static int kb_get_report(const struct device *dev,
 	case VKB_REPORT_ID_ABS:
 		report = ab_report;
 		size = AB_REPORT_COUNT;
+		break;
+	case VKB_REPORT_ID_CONSUMER:
+		report = consumer_report;
+		size = CONSUMER_REPORT_COUNT;
 		break;
 	default:
 		return -ENOTSUP;
@@ -446,12 +492,16 @@ int usb_kbd_report(uint8_t mods, uint8_t key)
 	ret = hid_device_submit_report(hid_dev, KB_REPORT_COUNT, kb_report);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
-	} else if (!kb_sent_pulse_done) {
-		/* Submit is synchronous: a success means the host actually
-		 * polled the report off the interrupt IN endpoint.
-		 */
-		kb_sent_pulse_done = true;
-		app_led_debug(APP_LED_HID_SENT);
+	} else {
+		atomic_inc(&kbd_sent);
+		if (!kb_sent_pulse_done) {
+			/* Submit is synchronous: a success means the host
+			 * actually polled the report off the interrupt IN
+			 * endpoint.
+			 */
+			kb_sent_pulse_done = true;
+			app_led_debug(APP_LED_HID_SENT);
+		}
 	}
 
 	return ret;
@@ -476,6 +526,8 @@ int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel)
 	ret = hid_device_submit_report(hid_dev, MS_REPORT_COUNT, ms_report);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
+	} else {
+		atomic_inc(&mouse_sent);
 	}
 
 	return ret;
@@ -501,7 +553,43 @@ int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y)
 	ret = hid_device_submit_report(hid_dev, AB_REPORT_COUNT, ab_report);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
+	} else {
+		atomic_inc(&consumer_sent);
 	}
 
 	return ret;
+}
+
+int usb_consumer_report(uint16_t usage)
+{
+	int ret;
+
+	if (!atomic_get(&kb_ready)) {
+		app_led_debug(APP_LED_HID_FAIL);
+		return -ENOTCONN;
+	}
+
+	/* Descriptor declares a single 16-bit consumer usage (array over
+	 * 0..0xFFFF). Report = ID byte + usage LSB + usage MSB = 3 bytes.
+	 */
+	consumer_report[CONSUMER_REPORT_ID_IDX] = VKB_REPORT_ID_CONSUMER;
+	consumer_report[CONSUMER_USAGE_LO] = (uint8_t)usage;
+	consumer_report[CONSUMER_USAGE_HI] = (uint8_t)(usage >> 8);
+
+	ret = hid_device_submit_report(hid_dev, CONSUMER_REPORT_COUNT,
+				       consumer_report);
+	if (ret) {
+		app_led_debug(APP_LED_HID_FAIL);
+	} else {
+		atomic_inc(&consumer_sent);
+	}
+
+	return ret;
+}
+
+void usb_hid_drain_counts(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer)
+{
+	*kbd = (uint8_t)MIN(atomic_clear(&kbd_sent), 255);
+	*mouse = (uint8_t)MIN(atomic_clear(&mouse_sent), 255);
+	*consumer = (uint8_t)MIN(atomic_clear(&consumer_sent), 255);
 }

@@ -52,6 +52,7 @@ LOG_MODULE_REGISTER(inputstick, LOG_LEVEL_INF);
 #define IS_CMD_INIT		0x11	/* Android CMD_INIT = iOS WdgReset */
 #define IS_CMD_HID_REQ_STATUS	0x20
 #define IS_CMD_HID_KBD		0x21
+#define IS_CMD_HID_CONSUMER	0x22
 #define IS_CMD_HID_MOUSE	0x23
 #define IS_CMD_HID_TOUCH	0x26
 #define IS_CMD_HID_CLEAR	0x2A
@@ -90,6 +91,27 @@ static uint8_t pkt_flags;
 /* Handshake / ready state (dispatch thread + USBD thread). */
 static atomic_t handshake_done; /* SetUpdateInterval received */
 static atomic_t ready_sent;     /* Ready HIDStatusNotification emitted */
+
+/* Periodic HIDStatusNotification: interval from SetUpdateInterval (0x31),
+ * in units of 100 ms (param 4 = 400 ms); default 400 ms. The k_timer fires
+ * at that rate and defers the actual notify to the system workqueue.
+ */
+static atomic_t status_interval_ms = 400;
+
+static void status_timer_expired(struct k_timer *timer);
+static void status_work_fn(struct k_work *work);
+static K_TIMER_DEFINE(status_timer, status_timer_expired, NULL);
+static K_WORK_DEFINE(status_work, status_work_fn);
+
+static void start_status_timer(void)
+{
+	uint32_t iv = atomic_get(&status_interval_ms);
+
+	if (iv == 0) {
+		iv = 400;
+	}
+	k_timer_start(&status_timer, K_MSEC(iv), K_MSEC(iv));
+}
 
 /* Set by inputstick_reset() on the BT RX thread, honoured by the dispatch
  * thread (mirrors the typing.c reset_pending pattern).
@@ -186,7 +208,7 @@ static void respond_fw_info(void)
 	memset(info, 0, sizeof(info));
 	info[0] = 1;  /* firmwareType */
 	info[1] = 1;  /* versionMajor */
-	info[2] = 0;  /* versionMinor -> firmware version 100 */
+	info[2] = 1;  /* versionMinor -> firmware version 101 */
 	info[3] = 0;  /* versionHardware */
 	/* info[4..16] reserved, zero */
 	info[17] = 0x00; /* securityStatus */
@@ -197,19 +219,27 @@ static void respond_fw_info(void)
 
 static void send_hid_status(void)
 {
-	uint8_t st[12];
+	uint8_t st[11];
+	uint8_t kbd_drained, mouse_drained, consumer_drained;
 
 	memset(st, 0, sizeof(st));
 	st[0] = 0x05;  /* USB state = USBConfigured */
 	st[1] = 0x00;  /* keyboard LEDs */
-	st[2] = 0x01;  /* keyboard report protocol active */
+	st[2] = 0x01;  /* keyboard protocol: 1 = report protocol */
 	st[3] = 0x01;  /* keyboard buffer empty */
-	st[4] = 0x01;  /* mouse report protocol active */
+	st[4] = 0x01;  /* mouse protocol: 1 = report protocol */
 	st[5] = 0x01;  /* mouse buffer empty */
 	st[6] = 0x01;  /* consumer buffer empty */
-	/* st[7..9] drain counts = 0 (no flow-control buffer in M2) */
-	/* st[10] reserved, zero */
-	st[11] = 0xFF; /* Android marker: read the sent-to-host counts */
+	/* st[7..9] = reports sent to host since the last notify (the drain
+	 * counts the app uses to replenish its free-space counters). Read and
+	 * reset the per-interface counters atomically.
+	 */
+	usb_hid_drain_counts(&kbd_drained, &mouse_drained, &consumer_drained);
+	st[7] = kbd_drained;
+	st[8] = mouse_drained;
+	st[9] = consumer_drained;
+	st[10] = 0xFF; /* sent-to-host gate: USB Remote reads data[11]==0xFF
+			* (= offset +10) before trusting st[7..9] */
 
 	is_send_notification(IS_CMD_HID_STATUS_NOTIF, st, sizeof(st));
 }
@@ -228,8 +258,27 @@ static void try_send_ready(void)
 
 	atomic_set(&ready_sent, 1);
 	send_hid_status();
+	start_status_timer();
 	app_led_debug(APP_LED_IS_READY);
 	LOG_INF("Ready: HIDStatusNotification (USBConfigured) sent");
+}
+
+/* Timer expiry runs in ISR context; the actual notify is deferred to the
+ * system workqueue (bt_gatt_notify must not run on the BT RX thread, and
+ * keep the ISR path minimal).
+ */
+static void status_timer_expired(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+
+	k_work_submit(&status_work);
+}
+
+static void status_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	send_hid_status();
 }
 
 /* --- HID report mapping (spec §6) -------------------------------------- */
@@ -306,6 +355,26 @@ static void hid_touch(const uint8_t *data, uint16_t data_len, uint8_t n)
 	}
 }
 
+/* Consumer (0x22): [reportID, usageLSB, usageMSB] per report.
+ * reportID 1 = Consumer page (media keys: Play/Pause 0xCD, Vol+ 0xE9,
+ * Vol- 0xEA, Mute 0xE2, next 0xB5, prev 0xB6, …) -> USB consumer report.
+ * reportID 2 = System page (power/sleep/wake) -> skipped safely (no System
+ * Control collection in this build). Any other report ID is ignored.
+ */
+static void hid_consumer(const uint8_t *data, uint16_t data_len, uint8_t n)
+{
+	uint8_t count = MIN(n, (uint8_t)(data_len / 3));
+
+	for (uint8_t i = 0; i < count; i++) {
+		const uint8_t *r = &data[i * 3];
+		uint16_t usage = (uint16_t)(r[1] | (r[2] << 8));
+
+		if (r[0] == 1) {
+			usb_consumer_report(usage);
+		}
+	}
+}
+
 /* --- command dispatch (spec §4) ---------------------------------------- */
 
 static void dispatch_packet(const uint8_t *payload, uint16_t total,
@@ -339,6 +408,7 @@ static void dispatch_packet(const uint8_t *payload, uint16_t total,
 	switch (cmd) {
 	case IS_CMD_HID_KBD_SHORT:
 	case IS_CMD_HID_KBD:
+	case IS_CMD_HID_CONSUMER:
 	case IS_CMD_HID_MOUSE:
 	case IS_CMD_HID_TOUCH:
 		break;
@@ -362,8 +432,19 @@ static void dispatch_packet(const uint8_t *payload, uint16_t total,
 			is_respond(IS_CMD_SET_UPDATE_INTERVAL, IS_RESP_OK,
 				   NULL, 0);
 		}
+		/* param is in units of 100 ms (param 4 = 400 ms). */
+		{
+			uint32_t iv = (uint32_t)param * 100U;
+
+			atomic_set(&status_interval_ms, iv ? iv : 400U);
+		}
 		atomic_set(&handshake_done, 1);
-		try_send_ready();
+		if (atomic_get(&ready_sent)) {
+			/* Re-issued interval after Ready: restart the timer. */
+			start_status_timer();
+		} else {
+			try_send_ready();
+		}
 		break;
 	case IS_CMD_HID_REQ_STATUS:
 		send_hid_status();
@@ -373,6 +454,9 @@ static void dispatch_packet(const uint8_t *payload, uint16_t total,
 		break;
 	case IS_CMD_HID_KBD:
 		hid_kbd(data, data_len, param);
+		break;
+	case IS_CMD_HID_CONSUMER:
+		hid_consumer(data, data_len, param);
 		break;
 	case IS_CMD_HID_MOUSE:
 		hid_mouse(data, data_len, param);
@@ -388,10 +472,14 @@ static void dispatch_packet(const uint8_t *payload, uint16_t total,
 		break;
 	case IS_CMD_IDENTIFY:
 		/* "Find device": the packet blink above already pulses the
-		 * LED; reply defensively if a response was requested.
+		 * LED; reply defensively if a response was requested. The
+		 * management screen requires data[0] == 0x42 ('B' = firmware
+		 * running) to proceed.
 		 */
 		if (respond) {
-			is_respond(IS_CMD_IDENTIFY, IS_RESP_OK, NULL, 0);
+			uint8_t mode = 0x42;
+
+			is_respond(IS_CMD_IDENTIFY, IS_RESP_OK, &mode, 1);
 		}
 		break;
 	default:
@@ -439,6 +527,8 @@ static void dispatch_thread(void *p1, void *p2, void *p3)
 			atomic_set(&reset_pending, 0);
 			atomic_set(&handshake_done, 0);
 			atomic_set(&ready_sent, 0);
+			atomic_set(&status_interval_ms, 400);
+			k_timer_stop(&status_timer);
 			ring_buf_reset(&is_ring);
 			continue;
 		}
