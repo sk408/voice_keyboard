@@ -3,21 +3,23 @@
  * `{{field}}` fill-in fields (see MacroPanel for the UI).
  *
  * Pure module — no BLE/DOM imports beyond protocol.ts; unit-tested in
- * macros.test.ts.
+ * macros.test.ts. Encoding targets the InputStick packet protocol (v6):
+ * every segment compiles to framed packets (keyboard-short state reports,
+ * absolute pointer, …) that are sent as-is over NUS.
  *
  * Tokens (single braces, case-insensitive, inner whitespace trimmed):
- *   {tab} {enter}                        → raw bytes 0x09 / 0x0a
+ *   {tab} {enter}                        → Tab / Enter key taps
  *   {esc} {up} {down} {left} {right} {del} {home} {end} {pgup} {pgdn} {f1}–{f12}
- *                                        → SPECIAL_KEYS escape sequences
- *   {ctrl+x} {ctrl+shift+t} {alt+f4}     → encodeStickyArm(mask) + key encoding
+ *                                        → special-key taps (HID keycodes)
+ *   {ctrl+x} {ctrl+shift+t} {alt+f4}     → one [mask, key] press + release
  *   {{field name}}                       → fill-in field (double braces)
  *   {click 80% 90%}                      → left-click at that percent of the actual
  *                                          screen (via the calibration map)
  *   {click "Save button"}                → left-click at a saved landmark (name
  *                                          matching is case-insensitive)
  *
- * Click tokens encode as an absolute-pointer press+release pair (v4
- * protocol); an unresolvable landmark encodes as zero bytes, never a throw.
+ * Click tokens encode as an absolute-pointer press+release pair; an
+ * unresolvable landmark encodes as zero bytes, never a throw.
  *
  * Unknown or malformed `{...}` tokens are kept as literal text — a macro must
  * never crash and never silently drop user text.
@@ -25,8 +27,8 @@
 import {
   MODIFIER_BITS,
   encodeAbsolute,
+  encodeEditByte,
   encodeSpecialKey,
-  encodeStickyArm,
   encodeText,
   type ModifierKey,
   type SpecialKey,
@@ -214,14 +216,15 @@ export function macroFields(template: string): string[] {
   return names;
 }
 
-function encodeChordTarget(target: ChordTarget): Uint8Array {
+function encodeChordTarget(target: ChordTarget, mask: number): Uint8Array {
   switch (target.type) {
     case 'char':
-      return encodeText(target.char);
+      // encodeText handles the shift needed by the character itself.
+      return encodeText(target.char, mask);
     case 'key':
-      return encodeSpecialKey(target.key);
+      return encodeSpecialKey(target.key, mask);
     case 'byte':
-      return new Uint8Array([target.byte]);
+      return encodeEditByte(target.byte, mask);
   }
 }
 
@@ -262,10 +265,9 @@ export function encodeSegment(
     case 'key':
       return encodeSpecialKey(segment.key);
     case 'byte':
-      return new Uint8Array([segment.byte]);
+      return encodeEditByte(segment.byte);
     case 'chord':
-      // Sticky arm auto-releases after one keystroke (v2 protocol).
-      return concatBytes([encodeStickyArm(segment.mask), encodeChordTarget(segment.target)]);
+      return encodeChordTarget(segment.target, segment.mask);
     case 'click':
       return encodeClick(segment.target, ctx);
   }

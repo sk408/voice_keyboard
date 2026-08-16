@@ -2,64 +2,18 @@
  * localStorage persistence for user macros, plus example seeding and
  * import/export helpers. Kept DOM-free except for localStorage so the panel
  * stays thin.
+ *
+ * Firmware v6 has no dongle-side macro store (v5.14 removed it), so macros
+ * live only here; running one streams InputStick packets over BLE.
  */
 
 export interface Macro {
   id: string;
   name: string;
   template: string;
-  /**
-   * Dongle slot (0–15) when this macro is stored on the v5 dongle; absent
-   * for local drafts that still need to be pushed. Persisted as part of the
-   * localStorage read-through cache; re-validated against MACRO_LIST on
-   * every connect.
-   */
-  slot?: number;
 }
 
 const STORAGE_KEY = 'voicekb.macros';
-
-/**
- * Offline deletions: when a synced macro is deleted (or a synced macro is
- * edited) while no v5 dongle is connected, the dongle still holds the old
- * copy. We record a tombstone — name + compiled byte length identifies the
- * dongle slot closely enough — and the next sync issues the del op before
- * merging, so offline edits/deletes don't resurrect or duplicate.
- */
-const DELETES_STORAGE_KEY = 'voicekb.macroDeletes';
-
-export interface MacroTombstone {
-  name: string;
-  len: number;
-}
-
-export function loadTombstones(): MacroTombstone[] {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(DELETES_STORAGE_KEY) ?? '[]');
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (t): t is MacroTombstone =>
-        typeof t === 'object' &&
-        t !== null &&
-        typeof (t as MacroTombstone).name === 'string' &&
-        typeof (t as MacroTombstone).len === 'number',
-    );
-  } catch {
-    return [];
-  }
-}
-
-export function saveTombstones(tombstones: MacroTombstone[]): void {
-  try {
-    localStorage.setItem(DELETES_STORAGE_KEY, JSON.stringify(tombstones));
-  } catch {
-    /* storage unavailable — non-fatal */
-  }
-}
-
-export function addTombstone(tombstone: MacroTombstone): void {
-  saveTombstones([...loadTombstones(), tombstone]);
-}
 
 export function newMacroId(): string {
   try {

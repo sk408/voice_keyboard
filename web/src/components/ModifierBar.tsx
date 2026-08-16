@@ -2,10 +2,11 @@ import { useAppStore, type Modifiers } from '../store';
 import type { ModifierKey } from '../protocol';
 
 /**
- * Sticky modifier bar (protocol v2). Tap cycles each modifier through
- * off → armed (applies to the next key, 0x81) → locked (held, 0x82) → off
- * (0x82 with the remaining set, or 0x83 when nothing stays held). Armed
- * and locked state is always visible on the buttons and the status line.
+ * Sticky modifier bar. Tap cycles each modifier through off → armed
+ * (applies to the next key only) → locked (held) → off. Armed modifiers ride
+ * the press report of the next keystroke; locked modifiers are a held
+ * keyboard state on the dongle ([mask, 0] reports). Armed and locked state
+ * is always visible on the buttons and the status line.
  */
 const ORDER: ModifierKey[] = ['ctrl', 'shift', 'alt', 'gui'];
 const LABELS: Record<ModifierKey, string> = {

@@ -9,8 +9,8 @@ import { screenFractionToNorm } from '../calibration';
  * v5.11 gesture model:
  * - one-finger drag  → the configured one-finger mode:
  *     · absolute (default): the pad maps to the whole screen through the
- *       calibration map; the cursor tracks the finger (0x91 packets)
- *     · relative: classic deltas (0x90 dx/dy)
+ *       calibration map; the cursor tracks the finger (InputStick 0x26 absolute-pointer packets)
+ *     · relative: classic deltas (0x23 mouse dx/dy)
  * - two-finger drag  → classic relative deltas ("fine control") from the
  *                      cursor's current position, in either mode — the
  *                      second finger never triggers an absolute jump, and
@@ -18,8 +18,8 @@ import { screenFractionToNorm } from '../calibration';
  *                      relative until the other lifts too (no disengage jump)
  * - scroll strip     → vertical drag = wheel (natural direction: up = up)
  * - buttons below    → hold-to-press left/middle/right via the relative
- *                      mouse (0x90); the touchpad itself never clicks, so the
- *                      absolute pointer (0x91) button byte is always 0
+ *                      mouse (0x23); the touchpad itself never clicks, so the
+ *                      absolute pointer (0x26) tip bit is always clear
  *
  * Packets are flushed at ~50 pkt/s. Pointer events with pointer capture
  * cover both touch and mouse input.
@@ -62,7 +62,7 @@ export default function MousePad() {
   const pending = useRef({ dx: 0, dy: 0, wheel: 0 });
   /** Latest absolute position awaiting the next flush (null = nothing new). */
   const pendingAbs = useRef<{ x: number; y: number } | null>(null);
-  /** Buttons held via the on-screen buttons (ride in relative 0x90 packets). */
+  /** Buttons held via the on-screen buttons (ride in relative 0x23 mouse packets). */
   const heldButtons = useRef(0);
   const flushTimer = useRef<number | undefined>(undefined);
 
@@ -195,7 +195,7 @@ export default function MousePad() {
   const pressButton = (bit: number, down: boolean) => {
     if (!connected) return;
     heldButtons.current = down ? heldButtons.current | bit : heldButtons.current & ~bit;
-    // Clicks ride the relative mouse (0x90): the absolute pointer (0x91)
+    // Clicks ride the relative mouse (0x23): the absolute pointer (0x26)
     // never asserts a button, so touchpad movement stays pure pointing.
     sendMouseRef.current(heldButtons.current, 0, 0, 0);
   };

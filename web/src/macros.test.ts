@@ -1,7 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import { encodeMacro, encodeSegment, macroFields, tokenizeMacro, type ClickContext } from './macros';
-import { MODIFIER_BITS, encodeText } from './protocol';
+import {
+  CMD,
+  KEY,
+  MODIFIER_BITS,
+  PacketParser,
+  encodeText,
+  type KbdReport,
+} from './protocol';
 import type { CalibrationMap } from './calibration';
+
+/** Decode all packets in an encoded buffer. */
+function parseAll(data: Uint8Array) {
+  return new PacketParser().feed(data);
+}
+
+/** Extract [modifiers, keycode] reports from the 0x2C packets in `data`. */
+function kbdReports(data: Uint8Array): KbdReport[] {
+  const reports: KbdReport[] = [];
+  for (const p of parseAll(data)) {
+    expect(p.cmd).toBe(CMD.HidKeyboardShort);
+    for (let i = 0; i + 1 < (p.param ?? 0) * 2; i += 2) {
+      reports.push([p.data[i], p.data[i + 1]]);
+    }
+  }
+  return reports;
+}
+
+/** Extract the 6-byte reports from the 0x26 touchscreen packets in `data`. */
+function touchReports(data: Uint8Array): number[][] {
+  return parseAll(data).map((p) => {
+    expect(p.cmd).toBe(CMD.HidTouch);
+    return [...p.data.slice(0, 6)];
+  });
+}
 
 describe('tokenizeMacro', () => {
   it('keeps plain text as a single text segment', () => {
@@ -121,63 +153,91 @@ describe('encodeMacro / encodeSegment', () => {
     expect([...encodeMacro('hello')]).toEqual([...encodeText('hello')]);
   });
 
-  it('encodes {esc} as its two-byte escape sequence', () => {
-    expect([...encodeMacro('{esc}')]).toEqual([0x00, 0x01]);
-  });
-
-  it('encodes {tab} and {enter} as raw bytes', () => {
-    expect([...encodeMacro('{tab}')]).toEqual([0x09]);
-    expect([...encodeMacro('{enter}')]).toEqual([0x0a]);
-  });
-
-  it('encodes {ctrl+x} as sticky-arm ctrl + x', () => {
-    expect([...encodeMacro('{ctrl+x}')]).toEqual([0x00, 0x81, 0x01, 0x78]);
-  });
-
-  it('encodes {alt+f4} as sticky-arm alt + f4 escape', () => {
-    expect([...encodeMacro('{alt+f4}')]).toEqual([0x00, 0x81, 0x04, 0x00, 0x13]);
-  });
-
-  it('substitutes field values via encodeText', () => {
-    expect([...encodeMacro('Hello {{name}}!', { name: 'Ada' })]).toEqual([
-      ...encodeText('Hello Ada!'),
+  it('encodes {esc} as a press+release of the Esc HID keycode', () => {
+    expect(kbdReports(encodeMacro('{esc}'))).toEqual([
+      [0, 0x29],
+      [0, 0],
     ]);
   });
 
-  it('encodes a missing field value as empty text', () => {
-    expect([...encodeMacro('[{{name}}]')]).toEqual([...encodeText('[]')]);
+  it('encodes {tab} and {enter} as Tab/Enter key taps', () => {
+    expect(kbdReports(encodeMacro('{tab}'))).toEqual([
+      [0, KEY.tab],
+      [0, 0],
+    ]);
+    expect(kbdReports(encodeMacro('{enter}'))).toEqual([
+      [0, KEY.enter],
+      [0, 0],
+    ]);
   });
 
-  it('passes unknown tokens through as literal text bytes', () => {
+  it('encodes {ctrl+x} as one ctrl+x press and release', () => {
+    expect(kbdReports(encodeMacro('{ctrl+x}'))).toEqual([
+      [MODIFIER_BITS.ctrl, 0x1b], // x
+      [0, 0],
+    ]);
+  });
+
+  it('encodes {alt+f4} as one alt+F4 press and release', () => {
+    expect(kbdReports(encodeMacro('{alt+f4}'))).toEqual([
+      [MODIFIER_BITS.alt, 0x3d], // F4
+      [0, 0],
+    ]);
+  });
+
+  it('substitutes field values (per-segment packets, same keystrokes as inline text)', () => {
+    // Segments encode as separate packets, so compare the keystroke stream,
+    // not the raw framing.
+    expect(kbdReports(encodeMacro('Hello {{name}}!', { name: 'Ada' }))).toEqual(
+      kbdReports(encodeText('Hello Ada!')),
+    );
+  });
+
+  it('encodes a missing field value as empty text', () => {
+    expect(kbdReports(encodeMacro('[{{name}}]'))).toEqual(kbdReports(encodeText('[]')));
+  });
+
+  it('passes unknown tokens through as literal text', () => {
     expect([...encodeMacro('{bogus}')]).toEqual([...encodeText('{bogus}')]);
   });
 
   it('concatenates a mixed template in order', () => {
-    expect([...encodeMacro('A{tab}B')]).toEqual([...encodeText('A'), 0x09, ...encodeText('B')]);
+    expect(kbdReports(encodeMacro('a{tab}b'))).toEqual([
+      [0, 0x04], // a
+      [0, 0],
+      [0, KEY.tab],
+      [0, 0],
+      [0, 0x05], // b
+      [0, 0],
+    ]);
   });
 
   it('encodeSegment encodes a single field with its value', () => {
-    expect([...encodeSegment({ type: 'field', name: 'n' }, { n: 'x' })]).toEqual([0x78]);
+    expect(kbdReports(encodeSegment({ type: 'field', name: 'n' }, { n: 'x' }))).toEqual([
+      [0, 0x1b],
+      [0, 0],
+    ]);
   });
 });
 
-describe('click tokens (v4)', () => {
-  // round(0.8 * 32767) = 26214 = 0x6666; round(0.9 * 32767) = 29490 = 0x7332
+describe('click tokens', () => {
+  // round(0.8 * 32767) = 26214 → ×2 on the wire = 52428 = 0xCCCC
+  // round(0.9 * 32767) = 29490 → ×2 on the wire = 58980 = 0xE664
   const click8090 = [
-    0x00, 0x91, 0x01, 0x66, 0x66, 0x32, 0x73, // press (left button)
-    0x00, 0x91, 0x00, 0x66, 0x66, 0x32, 0x73, // release
+    [4, 0x03, 0xcc, 0xcc, 0x64, 0xe6], // press (tip down)
+    [4, 0x02, 0xcc, 0xcc, 0x64, 0xe6], // release
   ];
 
   it('encodes a percent click with the identity map as press + release', () => {
-    expect([...encodeMacro('{click 80% 90%}')]).toEqual(click8090);
+    expect(touchReports(encodeMacro('{click 80% 90%}'))).toEqual(click8090);
   });
 
   it('applies a non-identity calibration map to percent clicks', () => {
     const map: CalibrationMap = { minX: 8192, maxX: 24576, minY: 0, maxY: 32767 };
-    // fx=0.5 → 8192 + 0.5*16384 = 16384 = 0x4000; fy=1 → 32767 = 0x7fff
-    expect([...encodeMacro('{click 50% 100%}', {}, { map })]).toEqual([
-      0x00, 0x91, 0x01, 0x00, 0x40, 0xff, 0x7f,
-      0x00, 0x91, 0x00, 0x00, 0x40, 0xff, 0x7f,
+    // fx=0.5 → 16384 → wire 32768 = 0x8000; fy=1 → 32767 → wire 65534 = 0xFFFE
+    expect(touchReports(encodeMacro('{click 50% 100%}', {}, { map }))).toEqual([
+      [4, 0x03, 0x00, 0x80, 0xfe, 0xff],
+      [4, 0x02, 0x00, 0x80, 0xfe, 0xff],
     ]);
   });
 
@@ -186,9 +246,9 @@ describe('click tokens (v4)', () => {
     const ctx: ClickContext = {
       landmark: (name) => landmarks.find((l) => l.name.toLowerCase() === name.toLowerCase()),
     };
-    expect([...encodeMacro('{click "save button"}', {}, ctx)]).toEqual([
-      0x00, 0x91, 0x01, 100, 0, 200, 0,
-      0x00, 0x91, 0x00, 100, 0, 200, 0,
+    expect(touchReports(encodeMacro('{click "save button"}', {}, ctx))).toEqual([
+      [4, 0x03, 200, 0, 400 & 0xff, 400 >> 8],
+      [4, 0x02, 200, 0, 400 & 0xff, 400 >> 8],
     ]);
   });
 
@@ -198,15 +258,18 @@ describe('click tokens (v4)', () => {
     expect(encodeMacro('{click "no resolver"}')).toHaveLength(0);
   });
 
-  it('keeps malformed click tokens as literal text bytes', () => {
+  it('keeps malformed click tokens as literal text', () => {
     expect([...encodeMacro('{click 80}')]).toEqual([...encodeText('{click 80}')]);
   });
 
   it('mixes text, click and chord in one template', () => {
-    expect([...encodeMacro('Go{click 80% 90%}{ctrl+s}')]).toEqual([
-      ...encodeText('Go'),
-      ...click8090,
-      0x00, 0x81, 0x01, 0x73, // sticky-arm ctrl + 's'
+    const encoded = encodeMacro('go{click 80% 90%}{ctrl+s}');
+    const packets = parseAll(encoded);
+    expect(packets.map((p) => p.cmd)).toEqual([
+      CMD.HidKeyboardShort, // 'go'
+      CMD.HidTouch, // click press
+      CMD.HidTouch, // click release
+      CMD.HidKeyboardShort, // ctrl+s
     ]);
   });
 });

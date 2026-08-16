@@ -2,8 +2,9 @@ import { useAppStore } from '../store';
 import type { SpecialKey } from '../protocol';
 
 /**
- * Special keys bar. Tab/Enter/Backspace are plain protocol bytes
- * (\t / \n / 0x08); the rest are 0x00-escaped special codes.
+ * Special keys bar. Tab/Enter/Backspace go through the text path (they map
+ * to HID keycodes like any other character); the rest are named special
+ * keys. Everything is encoded as InputStick keyboard-short packets.
  */
 type KeyDef =
   | { label: string; kind: 'special'; key: SpecialKey; wide?: boolean }

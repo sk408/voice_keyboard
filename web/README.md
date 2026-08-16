@@ -2,13 +2,18 @@
 
 A PWA that turns your phone into a Bluetooth keyboard + mouse for your PC.
 It connects over Web Bluetooth to an nRF52840 dongle (advertised as
-`VoiceKB`) plugged into the PC; the dongle is a composite USB HID device
-(keyboard + mouse) to the PC, so whatever you type, dictate, or gesture on
-the phone appears on the PC. Voice input comes free from the phone
-keyboard's dictation mic (e.g. Gboard).
+`InputStick`) plugged into the PC; the dongle is a composite USB HID device
+(keyboard + mouse + absolute pointer) to the PC, so whatever you type,
+dictate, or gesture on the phone appears on the PC. Voice input comes free
+from the phone keyboard's dictation mic (e.g. Gboard).
 
-The wire protocol is defined in [`../PROTOCOL.md`](../PROTOCOL.md) — this app
-is a client of it.
+The wire protocol is the **InputStick packet protocol** defined in
+[`../INPUTSTICK_EMULATION_SPEC.md`](../INPUTSTICK_EMULATION_SPEC.md) —
+framed packets (`0x55` tag + block header + CRC32) over the Nordic UART
+Service. This app is a client of it, same as the InputStick iOS/Android
+apps. It requires dongle firmware **v6.0** or later; the v1–v5 raw
+ASCII/escape protocol ([`../PROTOCOL.md`](../PROTOCOL.md)) is gone from both
+sides.
 
 ## Browser requirements
 
@@ -19,32 +24,35 @@ is a client of it.
 
 ## Usage
 
-### Connect & pair
+### Connect
 
 1. Plug the dongle into the PC.
-2. Open the app and tap **Connect**. The chooser shows only devices with the
-   NUS service or a `VoiceKB` name prefix.
-3. On the **first** connection the link must be paired (Just Works bonding).
-   If pairing fails or the device won't connect, **press the button on the
-   dongle** to open the 60-second pairing window, then tap Connect again.
-4. After a successful pair the bond persists: reconnects don't need the
-   button. Previously granted devices appear as one-tap **Reconnect** buttons
-   (via `navigator.bluetooth.getDevices()`), no chooser needed.
-5. If the bond on the phone/PC side gets out of sync, use **Forget**, then
-   pair again from scratch.
+2. Open the app and tap **Connect**. The chooser shows devices with the NUS
+   service or an `InputStick` name prefix.
+3. v6 needs no pairing or bonding — the link is plaintext NUS. On connect
+   the app runs the InputStick handshake (RunFirmware → GetFirmwareInfo →
+   SetUpdateInterval); a dongle that doesn't answer the handshake is running
+   pre-v6 firmware and the connect fails with a clear error.
+4. Previously granted devices appear as one-tap **Reconnect** buttons (via
+   `navigator.bluetooth.getDevices()`), no chooser needed.
 
-The status bar shows connection state, paired state, and a typing-status
-badge. The badge flips to **typing…** optimistically the moment a send is
-queued (and back to **ready** when all queued sends complete), and the
-dongle's TX notifications (`0x00` ready / `0x01` busy) drive it too. This
-makes the two failure modes distinguishable when debugging: badge flips
-but nothing is typed → the dongle side is dropping writes; badge never
-flips → the app-side write path is broken.
+The status bar shows connection state, the dongle's firmware version, and a
+typing-status badge. The badge flips to **typing…** optimistically the
+moment a send is queued (and back to **ready** when all queued sends
+complete), and the dongle's periodic `0x2F` HID-status notifications drive
+it too. This makes the two failure modes distinguishable when debugging:
+badge flips but nothing is typed → the dongle side is dropping writes; badge
+never flips → the app-side write path is broken.
 
-On the first connection, pairing (Just Works) is triggered by the first
-keystroke write — RX writes require an encrypted link, while the TX
-subscription does not. If a send fails with a pairing error, press the
-dongle button and retry within the 60-second window.
+### Flow control
+
+Every HID report the app sends debits a per-interface model of the dongle's
+report buffers (keyboard 128 / mouse 64 / consumer 64, matching the
+firmware's 256-deep shared HID queue). The dongle's `0x2F` status
+notifications report how many reports per interface were drained to USB;
+those replenish the model. A long dictation burst that would overrun the
+dongle simply waits for the next status notification instead of losing
+keystrokes.
 
 ### Live mode
 
@@ -53,6 +61,12 @@ autocorrect rewrites, and **voice dictation from the keyboard mic** — is
 diffed against the previous value and streamed to the PC as it happens
 (backspaces + inserted text). Use this mode for dictation.
 
+Text is typed as USB HID keycodes on a **US keyboard layout** — the app maps
+each character to `[modifiers, keycode]` (shift added for capitals and
+symbols) and sends press/release report pairs as `HIDDataKeyboardShort`
+(0x2C) packets. Characters a US keyboard can't type (emoji, accented
+letters, CJK) are dropped.
+
 ### Compose mode
 
 Type, paste, or dictate a block of text, then tap **Send to PC** to type the
@@ -60,9 +74,10 @@ whole block out on the PC at once.
 
 ### Special keys bar
 
-Esc, Tab, Enter, Backspace, arrow keys and Delete. Tab/Enter/Backspace go as
-protocol bytes (`\t` / `\n` / `0x08`); the rest are sent as `0x00`-escaped
-special key codes per PROTOCOL.md.
+Esc, Tab, Enter, Backspace, arrow keys and Delete. Tab/Enter/Backspace go
+through the text path (they map to HID keycodes like any other character);
+the rest are named special keys. Everything is sent as keyboard-short
+packets.
 
 ### Sticky modifiers (keyboard tab)
 
@@ -71,14 +86,13 @@ cycles a modifier through three states, all visible on the button and in
 the status line below the bar:
 
 - **armed** (`next`) — applies to the *next* key or special key only: the
-  key goes out prefixed with `0x00 0x81 <mask>` and the modifier disarms.
-  Arm several modifiers to compose a chord (Ctrl + Shift armed, then T →
-  `0x81` with mask `0x03`).
-- **locked** (`hold`) — held down on the PC (`0x00 0x82 <mask>`) until
-  released; affects everything typed/clicked while held.
-- tap again → **off** (`0x00 0x82` with the remaining held set, or
-  `0x00 0x83` release-all when the last one is released). **Clear**
-  releases everything.
+  modifier bits ride that key's press report and the modifier disarms.
+  Arm several modifiers to compose a chord (Ctrl + Shift armed, then T).
+- **locked** (`hold`) — held down on the PC until released: the app sends a
+  `[mask, 0]` keyboard-state report and includes the locked bits in every
+  keystroke while held.
+- tap again → **off** (a new `[mask, 0]` report with the remaining held set,
+  or all-zero when the last one is released). **Clear** releases everything.
 
 ### Macros tab
 
@@ -87,38 +101,25 @@ fill-in fields (`{{name}}`) and clicks (`{click 50% 25%}`,
 `{click "Save button"}`). **Run** types a macro through the dongle; Export /
 Import move the library between phones as JSON.
 
-With dongle firmware **vk-5.0** or later the dongle is the source of truth:
-macros are stored in its flash (16 slots, 16 KB total) and sync to whatever
-phone connects. On connect the app reads the dongle's list and merges it
-into the manager; localStorage is only a read-through cache. Details:
-
-- Badges on each row: **On dongle** (with the slot), **This phone** (local
-  draft), **★ Button macro** (slot 0).
-- A storage meter shows dongle usage (used / 16 KB).
-- **Migration**: if the dongle's store is empty but this phone has macros
-  (v3/v4 users), a banner offers a one-tap **Copy to dongle**.
-- **Offline**: with no dongle connected, edits and deletes queue as local
-  drafts (deletions are remembered as tombstones) and sync on the next
-  connect. Macros that don't fit stay on the phone, with a notice.
-- **Button macro**: the macro in slot 0 plays standalone — long-press
-  (>1.5 s) the dongle button with no BLE connection and the dongle types it
-  over USB on its own. Use the **★ Button** action on a macro to put it in
-  slot 0. A short button press is still the pairing window.
+Macros live on the phone (localStorage). Firmware v6 has no dongle-side
+macro store — the v5 store was removed in v5.14 and the characteristics no
+longer exist — so there is nothing to sync and no button macro.
 
 ### Mouse tab
 
-The **Mouse** tab is a trackpad plus a dedicated scroll strip. The v5.11
-gesture model:
+The **Mouse** tab is a trackpad plus a dedicated scroll strip. The gesture
+model:
 
 - **One finger** uses the configured one-finger mode (Settings → One-finger
   trackpad mode):
   - **Absolute pointer** (default): the pad maps to the whole screen through
     the calibration map — the cursor tracks your finger like a tablet, and
-    lifting + re-touching jumps the cursor (no deltas). Sent as `0x91`
-    absolute packets (HID report ID 3, pointer class) with a constant button
-    byte of 0. Windows maps the absolute pointer's logical extent
-    **linearly** to the screen — no pointer acceleration applies.
-  - **Classic relative**: ordinary touchpad deltas (`0x90` packets).
+    lifting + re-touching jumps the cursor (no deltas). Sent as
+    `HIDDataTouchScreen` (0x26) packets (report ID 4) with the tip bit clear.
+    Windows maps the absolute pointer's logical extent **linearly** to the
+    screen — no pointer acceleration applies.
+  - **Classic relative**: ordinary touchpad deltas (`HIDDataMouse` 0x23
+    packets).
 - **Two fingers** always give classic relative deltas ("fine control") from
   the cursor's current position, in either mode — the second finger never
   triggers an absolute jump, and lifting one finger of the pair keeps the
@@ -127,8 +128,8 @@ gesture model:
 - **Scroll strip** (right edge): vertical drag = scroll wheel, natural
   direction (drag up = scroll up).
 - **Left / Middle / Right** on-screen buttons are hold-to-press and click
-  through the relative mouse (`0x90`); the trackpad itself never clicks, so
-  the absolute pointer (0x91) button byte stays 0.
+  through the relative mouse (0x23); the trackpad itself never clicks, so
+  the absolute pointer (0x26) tip bit stays clear.
 
 All pointer packets are throttled to ~50/s. Switching tabs is pure view
 state — the BLE connection is owned by the store and is never torn down.
@@ -148,7 +149,7 @@ calibration) is verify-first:
    all four, a new map is derived and saved.
 
 The map is persisted per device (keyed by the dongle's name) and reloaded on
-connect. Requires firmware **vk-4.0** (absolute pointer, HID report ID 3).
+connect.
 
 ### Landmarks (Mouse tab)
 
@@ -163,10 +164,6 @@ can be used from macros:
 - `{click "Save button"}` — click at the named landmark. An unknown landmark
   stops the macro run with a warning instead of being silently skipped.
 
-Absolute-pointer features (absolute trackpad mode, calibration, landmarks,
-macro clicks) require dongle firmware **vk-4.0** or later (PROTOCOL.md: `0x91`
-packets, composite HID report ID 3).
-
 ## Install as a PWA (Android)
 
 1. Open the deployed app in Chrome: `https://<user>.github.io/voice_keyboard/`.
@@ -179,7 +176,7 @@ packets, composite HID report ID 3).
 ```sh
 npm install
 npm run dev      # dev server (use --host to reach it from a phone; HTTPS required for BLE)
-npm test         # vitest — protocol encoding unit tests
+npm test         # vitest — protocol encoding + BLE queue/flow-control unit tests
 npm run build    # tsc --noEmit + vite build → dist/
 ```
 
@@ -188,10 +185,12 @@ Deployment is via GitHub Actions → GitHub Pages (see
 
 ## Layout
 
-- `src/protocol.ts` — pure protocol encoding (chunking, escaping, edit diffs, v2 modifier/mouse packets, v4 absolute pointer); unit-tested.
-- `src/ble.ts` — Web Bluetooth / NUS connection, write queue, error classification; queue unit-tested (`ble.test.ts`).
+- `src/protocol.ts` — InputStick packet framing + CRC32, packet parser, US-layout text→keycode mapping, keyboard/mouse/touch/consumer packet builders, live-edit diffing, flow-control model; unit-tested.
+- `src/ble.ts` — Web Bluetooth / NUS connection, InputStick handshake, serialized + paced write queue, 0x2F-driven flow control; queue unit-tested (`ble.test.ts`).
 - `src/calibration.ts` — screen-fraction ↔ normalized mapping, four-corner calibration, per-device persistence; unit-tested.
 - `src/landmarks.ts` — named absolute cursor spots, per-device persistence; unit-tested.
-- `src/store.ts` — zustand app state (connection, mode, status, modifier state, pointer mode, calibration, landmarks, errors).
+- `src/macroStorage.ts` — localStorage macro library + import/export.
+- `src/macros.ts` — macro template tokenizer → InputStick packets; unit-tested.
+- `src/store.ts` — zustand app state (connection, mode, status, modifier state, pointer mode, calibration, landmarks, macros, errors).
 - `src/components/` — status bar, mode toggle, live/compose inputs, sticky modifier bar, special keys bar, mouse trackpad + scroll strip, landmarks, calibration wizard.
 - `public/` — manifest, service worker, icons (`scripts/gen_icons.py` regenerates them).

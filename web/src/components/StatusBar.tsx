@@ -2,11 +2,10 @@ import { useAppStore } from '../store';
 
 export default function StatusBar() {
   const connection = useAppStore((s) => s.connection);
-  const bonded = useAppStore((s) => s.bonded);
   const dongleStatus = useAppStore((s) => s.dongleStatus);
   const deviceName = useAppStore((s) => s.deviceName);
+  const firmwareVersion = useAppStore((s) => s.firmwareVersion);
   const error = useAppStore((s) => s.error);
-  const pairingHint = useAppStore((s) => s.pairingHint);
   const grantedDevices = useAppStore((s) => s.grantedDevices);
   const connectViaChooser = useAppStore((s) => s.connectViaChooser);
   const connectTo = useAppStore((s) => s.connectTo);
@@ -27,11 +26,9 @@ export default function StatusBar() {
         </span>
         {connected && (
           <>
-            <span className={`badge ${bonded ? 'badge-ok' : ''}`}>
-              {bonded ? 'paired' : 'unpaired'}
-            </span>
+            {firmwareVersion && <span className="badge badge-ok">fw {firmwareVersion}</span>}
             <span className={`badge ${dongleStatus === 'busy' ? 'badge-busy' : ''}`}>
-              {dongleStatus === 'busy' ? 'typing…' : dongleStatus === 'error' ? 'dongle error' : 'ready'}
+              {dongleStatus === 'busy' ? 'typing…' : dongleStatus === 'error' ? 'USB not ready' : 'ready'}
             </span>
           </>
         )}
@@ -62,7 +59,7 @@ export default function StatusBar() {
               disabled={connection === 'connecting'}
               onClick={() => void connectTo(d)}
             >
-              {d.name ?? 'VoiceKB dongle'}
+              {d.name ?? 'InputStick dongle'}
             </button>
           ))}
         </div>
@@ -71,12 +68,6 @@ export default function StatusBar() {
       {error && (
         <div className="error-banner" role="alert">
           <div>{error}</div>
-          {pairingHint && (
-            <div className="pairing-hint">
-              If this is your first time pairing (or the bond was cleared): press the button on the
-              dongle to enter pairing mode, then connect again within 60 seconds.
-            </div>
-          )}
           <button className="secondary" onClick={clearError}>
             Dismiss
           </button>
