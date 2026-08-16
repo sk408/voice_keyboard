@@ -12,8 +12,13 @@
 		 * with the HID boot protocol, so no boot protocol is claimed.
 		 */
 		protocol-code = "none";
-		/* Longest input report: keyboard = 1 ID byte + 8 report bytes. */
-		in-report-size = <9>;
+		/* Longest input report: keyboard = 1 ID byte + 8 report bytes.
+		 * MPS must be a power of two (16) — 9-byte keyboard reports ride
+		 * as short packets on the 16-byte endpoint, normal for
+		 * interrupt IN. A non-power-of-2 MPS (9) is a suspected
+		 * host-side drop trigger.
+		 */
+		in-report-size = <16>;
 		in-polling-period-us = <1000>;
 	};
 };

@@ -29,9 +29,18 @@ enum app_led_code {
 	APP_LED_IS_CRC_FAIL,	/* 11: InputStick packet CRC mismatch (200ms x2) */
 	APP_LED_IS_PKT,		/* 12: InputStick control packet dispatched (200ms x3) */
 	APP_LED_IS_READY,	/* 13: handshake done, Ready notification sent (200ms x4) */
+	/* v6.5-diagnostic: drain-count ground truth, see DEBUG_NOTES.md
+	 * v6.5-diagnostic. Fired from send_hid_status() every status interval.
+	 */
+	APP_LED_DRAIN_NONZERO,	/* 14: 3 quick blinks — a nonzero drain was computed */
+	APP_LED_DRAIN_ZERO,	/* 15: 1 long blink — all three drains are 0 */
 };
 
 void app_led_debug(enum app_led_code code);
+/* v6.6-diagnostic: one-way drain latch (red LED solid = drain went nonzero
+ * at least once). Implemented in main.c, called from inputstick.c.
+ */
+void app_drain_latch_set(void);
 /* Boot-stage trace (v5.1): red blink N = boot stage N completed. */
 void app_boot_stage(uint8_t stage);
 /* Boot sub-stage markers (v5.2): long (400 ms) blinks, see DEBUG_NOTES.md. */
@@ -58,6 +67,16 @@ int usb_consumer_report(uint16_t usage);
  * submits both count into the consumer figure (InputStick "consumer
  * queue"). Used by the periodic HIDStatusNotification. */
 void usb_hid_drain_counts(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer);
+/* v6.7: read the drain counters WITHOUT resetting (peek) and, after the 0x2F
+ * carrying those deltas has been accepted into the notify queue, subtract
+ * exactly the reported deltas (commit). See usb_kbd.c for the lossless
+ * peek-then-commit protocol. */
+void usb_hid_drain_counts_peek(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer);
+void usb_hid_drain_counts_commit(uint8_t kbd, uint8_t mouse, uint8_t consumer);
+/* v6.7: credit the consumer drain counter directly (no USB submit) for a
+ * 0x22 report the descriptor cannot represent (System page, report ID 2) so
+ * the app's per-report consumer accounting stays 1:1. */
+void usb_hid_consumer_credit(uint8_t count);
 
 /* --- BLE NUS peripheral (ble.c) --- */
 int ble_init(void);

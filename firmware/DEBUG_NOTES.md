@@ -1073,7 +1073,380 @@ RAM drops ~11 KB (typing.c's 16 KB ring and the crypto RAM gone; the
 inputstick ring is 8 KB + a 1.1 KB notify queue + the 3 KB dispatch thread).
 UF2 at `build/zephyr/zephyr.uf2`.
 
+## v6.2: HID submit deadlock fix (root cause: synchronous submit wedges the dispatch thread)
+
+Full root-cause analysis is in `../../FLOW_CONTROL_DIAGNOSIS.md`. The
+hardware stall ("types ~12 chars then stops", green solid, red dark) is a
+firmware deadlock: every HID report was submitted synchronously —
+`hid_device_submit_report()` blocks in `k_sem_take(..., K_FOREVER)` (Zephyr
+`usbd_hid.c:592-594`) because this firmware registered **no**
+`input_report_done` callback. When the host stops polling the interrupt-IN
+endpoint, the single dispatch thread wedges forever, the drain counters
+freeze at 0, and the app's `freeSpace` depletes. Three fixes ship:
+
+### 1. Non-blocking HID submits (`usb_kbd.c`) — the root-cause fix
+
+- `kb_ops` now registers `input_report_done = kb_input_report_done`, so
+  `hid_device_submit_report()` returns immediately after enqueueing the
+  transfer (the synchronous `k_sem_take(K_FOREVER)` path is bypassed).
+- A single FIFO (`k_msgq`, 128 nodes) holds byte-copied report nodes tagged
+  with their type (kbd/mouse/abs/consumer). The four submit functions
+  (`usb_kbd_report`/`usb_mouse_report`/`usb_abs_report`/
+  `usb_consumer_report`) build their static buffer, **copy** it into a node
+  (never alias the static buffer), enqueue with `K_NO_WAIT` (drop on full —
+  never block), and call `drain_next()`.
+- `drain_next()` claims a single in-flight slot with `atomic_cas`, dequeues
+  one node, copies it into the matching static buffer, and submits. At most
+  ONE report is in flight at a time across all four report types (one HID
+  interface, one interrupt-IN endpoint). On submit failure it drops the node
+  and tries the next (bounded by the queue) — never wedges.
+- `kb_input_report_done()` runs in USB-stack context: it identifies the type
+  from `report[0]` (the report-ID byte — the callback receives the same
+  buffer that was submitted), does `atomic_inc(&kbd_sent)`/`mouse_sent`/
+  `consumer_sent` (moved OUT of the submit functions — a report is only
+  "sent to host" once the callback fires), clears in-flight, and calls
+  `drain_next()`. It stays short: atomic ops + one dequeue + one submit, no
+  sleep, no blocking.
+- Buffer lifetime is safe: a static buffer is only rewritten when it is
+  about to be submitted, and the single-in-flight rule guarantees the
+  previous transfer has completed before the next submit reuses it.
+
+### 2. IN endpoint MPS 9 → 16 (power of two)
+
+`boards/nrf52840dongle_nrf52840.overlay`: `in-report-size = <9>` →
+`<16>`. A 9-byte MPS is legal-but-unusual for a full-speed interrupt
+endpoint and is a suspected host-side drop trigger. The 9-byte keyboard
+report now rides as a short packet on the 16-byte endpoint (normal for
+interrupt IN); all four reports (9/5/6/3 bytes) fit.
+
+### 3. Consumer descriptor usage range bounded
+
+`hid_report_desc` report ID 4 (consumer control) declared a 0..0xFFFF usage
+array (`HID_USAGE_MAX16(0xFF,0xFF)`). It is now bounded to
+`HID_USAGE_MAX16(0xFF,0x03)` = usage 0..0x3FF (the standard Consumer page
+extent), removing the unusual report ID 4 shape as a host-parser risk. The
+report **layout is unchanged** (still 1 ID byte + 2 data bytes = 3 bytes)
+and `usb_consumer_report()`/`CONSUMER_REPORT_COUNT` are unchanged. **Usage
+Min stays 0** so `report value == usage` is preserved — a non-zero minimum
+would offset every media key and break Play/Pause (0xCD)/Vol+ (0xE9)/etc.
+(the literal "0xE0..0xE7" example in the diagnosis would have broken this).
+
+### LED-code behavior
+
+No LED codes changed (same blink counts/meanings). Two call sites moved:
+
+- **2-blink (first report clocked out)** now fires from
+  `kb_input_report_done()` instead of `usb_kbd_report()`. Same meaning, but
+  it is now emitted the moment the transfer actually completes (previously a
+  synchronous-submit success implied the same thing).
+- **3-blink (HID submit failed)** additionally fires from `drain_next()`
+  when `hid_device_submit_report()` returns an error, and on queue-full
+  (`k_msgq_put` returning `-ENOMSG`) in the submit functions.
+
+The 400 ms status notification (`st[3]/st[5]/st[6]` buffer-empty bytes and
+the `st[7..9]` drain counts) is intentionally left unchanged; the drain
+counters are now accurate because they increment in the completion callback.
+
+DIS firmware revision is `vk-6.2`.
+
+## v6.3: rate-dependent flow-control stall — remove tap() pacing + fix static-buffer overwrite
+
+After the v6.2 non-blocking submit fix, the stall moved from a hard
+deadlock to a *rate-dependent* collapse: manual typing reached ~40 chars,
+then the built-in voice keyboard (dictation — faster, and it does backspace
+corrections) stalled, the USB Remote touchpad stalled with it, while sparse
+media keys kept working (proof the endpoint + `input_report_done` loop is
+alive). Root cause is two coupled bugs in the dispatch path, both now fixed.
+
+### Bug A — `tap()` sleeps 15 ms per keystroke on the single dispatch thread
+
+`inputstick.c` `tap()` (the `HIDDataKeyboardShort` 0x2C dictation path) did
+`k_msleep(KEY_PRESS_MS=5)` + `k_msleep(KEY_GAP_MS=10)` = **15 ms of sleep
+per keystroke** on the one dispatch thread (`is_tid`). That caps the dongle
+at ~66 keystrokes/s, while the app dumps dictation (and its correction
+bursts) faster than the firmware can drain: the app's per-interface
+`freeSpace` (`HIDTransactionBuffer`, capacity 128 for keyboard at firmware
+version ≥100) depletes to 0, the app stops sending, and the backlog —
+including the mouse/touchpad packets sharing the same thread — stalls
+behind it.
+
+The 15 ms pacing was legacy from the synchronous-submit design. The v6.2
+FIFO + single in-flight report + 1 ms interrupt-IN polling already pace the
+USB output natively and preserve press→release order, so the dispatch
+thread must not sleep. Fix: `KEY_GAP_MS` removed entirely, `KEY_PRESS_MS`
+5 → 1 (a 1 ms hold so the press report is enqueued before the release; the
+FIFO order guarantees the release is only submitted after the press
+completes, and the 1 ms endpoint poll gives each keystroke a ~1 ms hold).
+The "only release if press enqueued" guard is unchanged.
+
+### Bug B — static report buffers overwritten while in flight
+
+The four submit functions wrote their report into a static buffer
+(`kb_report`/`ms_report`/`ab_report`/`consumer_report`), *then* byte-copied
+it into a FIFO node, then enqueued. `drain_next()` copies a node back into
+that same static buffer and submits it. So a burst could call e.g.
+`usb_mouse_report()` and overwrite `ms_report` while a prior submit was
+still in flight (the single-in-flight slot only guards `drain_next()`
+against double-submit, NOT the submit functions against rewriting the
+shared buffer). `tap()`'s 5 ms sleep masked it for dictation; the
+mouse/consumer/0x21 paths had no such protection. This is exactly what would
+have broken the keyboard path the moment the v6.3 pacing removal landed:
+press would be overwritten by release before the host clocked it out, and
+no keystroke would register.
+
+Fix: the submit functions now build the report **directly into the FIFO
+node** (`node.data`) and never touch the static buffers. The static buffers
+are written *only* by `drain_next()`, which holds the single in-flight slot,
+so a buffer can never be overwritten while its transfer is outstanding.
+`drain_next()` still copies `node.data` into the aligned static buffer right
+before submit — this keeps the report UDC-aligned (the FIFO node's data is
+not guaranteed aligned, and `hid_dev_submit_report`/`hid_buf_alloc_ext`
+assert 4-byte/UDC alignment) and keeps the static buffers valid as the
+`kb_get_report()` last-report state. Mechanism chosen: **submit-to-node +
+drain-copies-to-exclusive-static-buffer** (the alignment-safe variant of
+"write directly into the node"); submitting `node.data` directly was
+rejected because it is a possibly-unaligned local copy that would also
+outlive its stack frame.
+
+### App-side confirmation (decompiled InputStickUtility)
+
+- **Dictation path is 0x2C.** `typeText()` → `pressAndRelease()` per
+  character builds a *short-keyboard* transaction (`HIDTransaction.
+  getShortKeyboardTransaction()`, cmd 44 = 0x2C),
+  `InputStickKeyboard.java:155-174,184-229`; `HIDReport.
+  getShortKeyboardReport()` = 2-byte `[mods, key]`, `HIDReport.java:17-19`.
+- **Reports per character:** 2 for an unmodified char (`[mods,key]` +
+  `[0,0]`), 3 for a shifted char (`[mods,0]` + `[mods,key]` + `[0,0]`).
+- **Batching:** `HIDTransactionBuffer.sendFromQueue()` batches many reports
+  into one TxPacket up to `maxReportsPerPacket` = **64** (keyboard),
+  `HIDTransactionBuffer.java:74-113`; capacity/freeSpace = **128** (set in
+  `HIDBuffersManager.setup()` for firmware version ≥100,
+  `HIDBuffersManager.java:23-34`; our `GetFirmwareInfo` reply reports
+  major=1/minor=1 → version `1*100+1 = 101`, `FirmwareInfo.java:20`,
+  `inputstick.c respond_fw_info`).
+- **freeSpace accounting:** decremented per *report* sent
+  (`freeSpace -= reportsCount2`, `HIDTransactionBuffer.java:104`) and
+  replenished per report drained (`freeSpace += reportsSentToHost`,
+  `HIDTransactionBuffer.java:44-50`). So the firmware's drain
+  (`kbd_sent`, one per clocked-out report) matches the app's decrement 1:1
+  (the shifted-char 3-vs-2 slow leak from the v6.1 diagnosis remains: it is
+  a minor drift, not this stall).
+- **Rate:** the app sends the whole dictation result as fast as freeSpace +
+  BLE allow (a 64-report packet at a time), so it easily outruns the
+  firmware's 66 keystrokes/s cap — the ~66/s tap() cap **is** exceeded by
+  dictation.
+
+### Also checked (no change needed)
+
+- **`usb_hid_drain_counts()` `atomic_clear` + `MIN(255)`** cannot lose
+  counts in steady state: each interface's freeSpace capacity (128/64/64)
+  bounds the per-400 ms drain to ≤128 (< 255), and `atomic_clear` is atomic
+  (no torn read). The 8-bit status byte is a protocol limit, not a bug.
+- **FIFO depth 128** matches the keyboard freeSpace capacity (128), so a
+  single maximal app burst cannot overflow the FIFO; the endpoint drains at
+  ~1000 reports/s. Drops remain a `K_NO_WAIT` last resort (logged + 3-blink),
+  never a block.
+
+DIS firmware revision is `vk-6.3`.
+
 ## Not verified here
 
 No dongle is attached to this machine, so none of this is hardware-tested.
 Build is clean and produces `build/zephyr/zephyr.uf2`.
+
+## v6.4: 0x2C keyboard-short is a state report, not a press+release tap
+
+Full root-cause analysis in `../../FLOW_CONTROL_V64_ANALYSIS.md`. The v6.3
+pacing fix removed the *rate* cap but left the *accounting* wrong: `tap()`
+(the `HIDDataKeyboardShort` 0x2C dictation path) synthesized its own
+press+release for each `[mods,key]` (2 USB submits) and skipped
+`[mods,0]`/`[0,0]` (`key == 0` early-return). The spec (§2.2,
+`USB_REMOTE_AND_PROTOCOL_DOCS.md:187-197`) says 0x2C is the **current
+keyboard state** — each short report is one keyboard-state report, and the
+*next* report releases the previous key. The USB Remote/Gboard path sends
+**3 reports per char** (`[mods,0]`+`[mods,key]`+`[0,0]`), so the firmware
+drained 2 per 3 and the app's `freeSpace` leaked 1 report per character,
+decaying geometrically (×⅔ per 400 ms status) to a stall.
+
+Fix: `tap()` now forwards each 0x2C report as exactly one
+`usb_kbd_report(mods, key)` — no `key == 0` skip, no press+release
+expansion, no `k_msleep`. The drain counter (`kbd_sent`, incremented once
+per submit in `kb_input_report_done`) is now 1:1 with the app's per-report
+`freeSpace` decrement, so the leak is closed. The app's trailing `[0,0]` is
+what releases the last key (no stuck keys), and dropping the 1 ms
+per-keystroke dispatch-thread sleep also clears the mouse/touchpad
+starvation that rode on the shared dispatch thread behind the decaying
+keyboard backlog. `KEY_PRESS_MS` (only caller was `tap()`) is removed;
+`KEY_GAP_MS` was already gone in v6.3. No change to `usb_kbd.c`,
+`send_hid_status`, the status timer, the buffer-empty bytes, or the
+mouse/touch/consumer paths.
+
+DIS firmware revision is `vk-6.4`.
+
+## v6.5-diagnostic: does `input_report_done` actually fire on the nRF52840?
+
+After the v6.4 0x2C state-report fix, the hardware symptom did **not**
+change: typing and the mouse still stall, the dongle is not stuck (closing +
+reopening the app fixes it), and the mouse stalls after ~1.5 s of movement
+alone (64 reports / ~50 reports/s = ~1.3 s). That is exactly the app's
+`freeSpace` depleting to 0 with **zero** replenishment — i.e. the drain
+counts (`st[7..9]` of the 400 ms `0x2F` status) are effectively 0 on
+hardware even though reports are submitted and appear on the host.
+
+Everything *upstream* of "the completion callback actually firing on
+silicon" is provably correct (see `../../DIAG_V65.md`): the callback is
+registered, it increments the drain counters, `buf->__buf` is the report
+ID byte, and `usbd_hid_request` calls it. The remaining unknown is whether
+the nRF52840 driver actually delivers the IN-completion event to the class
+layer — the driver forwards events through **two lossy `K_NO_WAIT` message
+queues** (`udc_nrf.c` `drv_msgq`, depth 8, and `usbd_core.c` `usbd_msgq`,
+depth 10) and ignores the return, so a dropped event would both wedge the
+endpoint *and* stop the drain counter. Static analysis cannot tell whether
+those drops occur on this dongle — so this build instruments the two
+"ground truth" points with red-LED codes and RTT logs.
+
+This is **observation only**. No functional behavior changed: the submit
+path, the drain counters, the status format/interval, and the notify path
+are byte-for-byte as v6.4.
+
+### Instrumentation added
+
+1. **Callback pulse** (`usb_kbd.c` `kb_input_report_done`): on **every**
+   invocation (any report ID), fire `APP_LED_HID_SENT` (2 × 80 ms red
+   blinks) + `LOG_INF("HID report done: report[0]=0x%02x")`, throttled to
+   one per ~300 ms via `k_uptime_get()`. The v6.2 one-shot
+   `kb_sent_pulse_done` is removed (its reset in `kb_iface_ready` too).
+   Non-blocking: `app_led_debug()` only reschedules a workqueue item.
+
+2. **Status drain pulse** (`inputstick.c` `send_hid_status`): after
+   `usb_hid_drain_counts()`, log the three deltas
+   (`LOG_INF("HID status: drain kbd=%u mouse=%u consumer=%u")`) and fire
+   one of two new LED codes:
+   - `APP_LED_DRAIN_NONZERO` (14) — **3 × 50 ms blinks** — at least one
+     drain count was nonzero this interval.
+   - `APP_LED_DRAIN_ZERO` (15) — **1 × 200 ms blink** — all three drains
+     are 0 (the reported bug).
+
+3. **Version**: DIS firmware revision is `vk-6.5-diag` so the diagnostic
+   build is unmistakable.
+
+### Red-LED codes to watch (v6.5-diagnostic)
+
+| Pattern | Meaning |
+|---|---|
+| 2 × 80 ms blinks, ~3 Hz | `input_report_done` **fired** (throttled heartbeat while reports complete) |
+| 3 × 50 ms blinks, ~2.5 Hz | a status interval computed a **nonzero** drain (freeSpace replenishing) |
+| 1 × 200 ms blink, ~2.5 Hz | a status interval computed an **all-zero** drain (the reported bug) |
+
+The status codes (14/15) repeat every status interval (~400 ms) regardless
+of input, so they are the "background beat" to watch. The callback code (2)
+only appears while reports are completing. Note: `APP_LED_RX_WRITE` (1 blink)
+still fires on every BLE write, so during continuous input the single red
+LED interleaves these patterns — for the cleanest read, stop input and watch
+the repeating status code, or attach a J-Link and read the RTT log lines
+(which are unambiguous).
+
+### Revert
+
+Delete the `kb_done_pulse_last` block + `LOG_INF` in `kb_input_report_done`,
+the drain LOG_INF + LED branch in `send_hid_status`, the two
+`APP_LED_DRAIN_*` enum entries in `vkb.h`, and the two cases in `main.c`
+`app_led_debug()`; restore `CONFIG_BT_DIS_FW_REV_STR` and the README title/
+DIS string to the prior version. No other file changed.
+
+DIS firmware revision is `vk-6.5-diag`.
+
+## v6.6-diagnostic: single latched red-LED signal — "is the drain ever nonzero?"
+
+v6.5's pulse-based instrumentation proved on hardware that
+`input_report_done` **does** fire (the 2×80 ms heartbeat appeared while
+typing), but the pulse codes themselves were too noisy to read: the one red
+LED carries RX-write (1 blink), the callback heartbeat (2 blinks), the
+handshake/connect codes (9/12/13), HID fail, mouse/abs RX, and the v6.5 drain
+pulses all at once, and they overlap during input. The open question is now
+narrower: **do the drain counters ever go nonzero** — i.e. does the 400 ms
+status packet ever report a nonzero `st[7..9]`?
+
+This build replaces all of that with **one latched signal and removes every
+other red-LED pulse**:
+
+1. `app_led_debug()` in `main.c` is a **no-op** (early `return`). Every
+   pulse-based code is silenced: RX-write 1-blink, callback heartbeat,
+   handshake/connect 9/12/13, HID fail, mouse/abs RX, and the v6.5 drain
+   pulses. The function and all its call sites stay in the tree (one-line
+   revert); `app_boot_stage()`/`app_boot_mark()` are untouched (they drive
+   the LED directly with `gpio_pin_set_dt` + `k_msleep`), so the boot 1→5
+   trace still works.
+2. A new one-way latch — `static atomic_t drain_latch` + `app_drain_latch_set()`
+   — drives the red LED **directly** (no pulse work item).
+   `inputstick.c` `send_hid_status()` calls it the moment any of
+   `kbd_drained` / `mouse_drained` / `consumer_drained` is nonzero. Once set,
+   the red LED turns **SOLID** and stays solid.
+3. The v6.5 RTT logs stay (ground truth with a J-Link attached):
+   `HID report done: report[0]=0x%02x` (throttled) and
+   `HID status: drain kbd=%u mouse=%u consumer=%u` (every status interval).
+
+### How to read it (flash → observe → interpret)
+
+1. **Boot**: 1→5 red blinks (unchanged), then the green advertising blink.
+2. **Connect**: green → solid (unchanged). There are **no** red handshake/
+   connect pulses anymore — that is expected.
+3. Type a few characters **and** move the mouse for a few seconds.
+4. Read the red LED:
+   - **SOLID red** → the drain went **nonzero at least once**. The firmware
+     drain path is fine; the stall is downstream in status delivery / app
+     parsing.
+   - **DARK red** (never lights after boot) → the drain was **always zero**.
+     The callback fires (v6.5 proved it) but the counters stay zero —
+     investigate the counter path.
+
+The latch is the *whole* signal: there are no other red pulses to confuse
+with it. The boot 1→5 trace is the only other red activity, and it finishes
+before advertising begins.
+
+### Revert
+
+Remove the early `return` from `app_led_debug()`, delete `drain_latch` +
+`app_drain_latch_set()` (and its declaration in `vkb.h`), restore the
+`send_hid_status()` drain branch to the v6.5
+`app_led_debug(APP_LED_DRAIN_NONZERO/ZERO)` form, and restore the version
+strings. No other file changed.
+
+DIS firmware revision is `vk-6.6-diag`.
+
+## v6.7-fix: drain-ratio leak — shared-FIFO overflow + lossless drain-credit delivery
+
+Root cause (see `/home/claude/voice_keyboard/RATIO_BUG_ANALYSIS.md`): the
+app's freeSpace depletes to 0 even though the drain counter fires because
+reports are dropped or credits misrouted with no matching drain credit. Three
+firmware bugs fixed in this build:
+
+1. **Shared report FIFO too small** (`usb_kbd.c`): `HID_REPORT_Q_DEPTH` was
+   128, but the single `hid_report_q` is shared across all four report types
+   while the app models **per-interface** capacity (128 kbd + 64 mouse + 64
+   consumer = **256**). Combined in-flight > 128 made `k_msgq_put(...,
+   K_NO_WAIT)` silently drop the surplus with no drain credit → freeSpace
+   leak. Raised to **256** (sufficient because the app self-limits each
+   interface to 128/64/64).
+
+2. **Drain deltas zeroed before the 0x2F is guaranteed delivered**
+   (`inputstick.c` + `usb_kbd.c`): `send_hid_status()` used
+   `usb_hid_drain_counts()` (read+zero) and then ignored the notify enqueue
+   result, so a full notify queue (`-EAGAIN`) permanently lost up to 255
+   credits/interface. Now **peek-then-commit**: `usb_hid_drain_counts_peek()`
+   reads without resetting, the 0x2F is queued via `is_send_notification()`
+   (now returns `ble_notify()`'s result), and only on a 0 return do we
+   `usb_hid_drain_counts_commit()` the reported deltas (saturating subtract,
+   never below zero). A failed notify leaves the counters intact so the next
+   status reports the accumulated total (self-healing).
+
+3. **Consumer report ID 2 silently dropped** (`inputstick.c`): `hid_consumer`
+   dropped 0x22 reports with `r[0] != 1` (System page) with no drain credit.
+   The descriptor has no System Control collection, so the report is not
+   forwarded as a USB report; instead `usb_hid_consumer_credit(1)` increments
+   `consumer_sent` directly, keeping the app's per-report consumer freeSpace
+   1:1.
+
+GetFirmwareInfo version unchanged (still 1.1 = 101, `respond_fw_info`); only
+the DIS string changed. 0x2F status byte layout unchanged
+(`FW_STATUS_LAYOUT.md`). DIS firmware revision is `vk-6.7-fix`.

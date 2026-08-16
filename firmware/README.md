@@ -1,4 +1,4 @@
-# Voice Keyboard firmware — nRF52840 dongle (v6.0)
+# Voice Keyboard firmware — nRF52840 dongle (v6.6-diag)
 
 Zephyr 4.1.0 application for the Nordic PCA10059 dongle (Adafruit UF2
 bootloader). The dongle enumerates as a single composite USB HID device —
@@ -53,7 +53,7 @@ abort `bt_enable()`.
 - **BLE**: advertises as `InputStick` with the NUS service UUID
   (`6E400001-...`). RX `6E400002-...` (write / write-no-resp, **plain** —
   no encryption/pairing), TX `6E400003-...` (notify, InputStick packets).
-  DIS firmware revision string: `vk-6.0`.
+  DIS firmware revision string: `vk-6.6-diag`.
 - **Protocol**: the InputStick packet protocol (see the spec §3/§4):
   `0x55` tag, 16-byte-block header with response/encrypt/HMAC flags, CRC32
   (IEEE 802.3) over command+param+data, zero-padded to a multiple of 16.
@@ -70,9 +70,14 @@ abort `bt_enable()`.
   `[reportID, tip, x, y]` to the absolute pointer (16-bit x/y scaled to
   15-bit). Unimplemented commands get a `RESP_OK (0x01)` when the response
   flag is set, else are ignored.
-- **Status / flow control**: M2 sends only the single Ready notification;
-  the periodic (400 ms) `HIDStatusNotification` + drain counter + report
-  buffer that complete the flow-control contract are M3 (TODO).
+- **Status / flow control**: after the handshake (and once the host
+  configures the HID interface) the dongle sends one Ready
+  `HIDStatusNotification`, then a periodic (400 ms, configurable via
+  `SetUpdateInterval`) `HIDStatusNotification` carrying the per-interface
+  drain counters (`st[7..9]` = keyboard/mouse/consumer reports sent to the
+  host since the last notify). The apps use those counters to replenish
+  their remote-buffer free-space (`freeSpace += drain`), which is what lets
+  long bursts keep flowing.
 - **LED** (green LED0): slow blink = advertising, solid = connected.
   Red debug LED1 blink codes (see DEBUG_NOTES.md): 1 = RX write, 2 = first
   report clocked out, 3 = HID submit failed/not ready, solid 1 s = HID
@@ -92,10 +97,14 @@ button does nothing.
 
 ## Known limitations
 
-- **Flow control is incomplete (M2).** Without the periodic
-  `HIDStatusNotification` + drain counter (M3), a long dictation burst will
-  eventually stop once the app's remote-buffer free-space counter reaches
-  zero. Short bursts type fine.
+- **Flow control depends on the app's free-space model.** The apps cap
+  their in-flight HID reports with a remote-buffer free-space counter that
+  is replenished by the firmware's 400 ms drain counts. v6.2 added the
+  periodic status + drain counter; v6.3 removed the per-keystroke pacing
+  that made fast dictation deplete free-space faster than the drain could
+  replenish it. If a host ever stops polling the interrupt-IN endpoint for
+  a long time, reports now queue (and ultimately drop) instead of wedging,
+  but free-space will not replenish until polling resumes.
 - **USB VID/PID** is `0x1209/0x0001` (pid.codes community VID). The PID is
   not officially registered; fine for personal use, not for distribution.
 - **No HID boot protocol**: the composite keyboard+mouse descriptor uses

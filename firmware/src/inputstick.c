@@ -62,9 +62,14 @@ LOG_MODULE_REGISTER(inputstick, LOG_LEVEL_INF);
 
 #define IS_RESP_OK		0x01
 
-/* Keystroke pacing for the dictation path (matches the v5 typing rate). */
-#define KEY_PRESS_MS	5
-#define KEY_GAP_MS	10
+/* Keystroke pacing for the dictation path. v6.4: no per-keystroke sleep is
+ * needed on the dispatch thread — KeyboardShort (0x2C) is forwarded 1:1 as
+ * a USB keyboard-state report, and the non-blocking HID FIFO (usb_kbd.c)
+ * paces the USB output natively (single in-flight report + 1 ms
+ * interrupt-IN polling preserves report order). KEY_GAP_MS was removed in
+ * v6.3; KEY_PRESS_MS had no remaining callers after tap() became a pure
+ * state-report forward, so it is removed too.
+ */
 
 /* RX queue: complete packets handed from the BT RX thread to the dispatch
  * thread. 8 KB holds ~430 keyboard-short packets or ~29 max-size packets;
@@ -183,14 +188,14 @@ static void is_send(uint8_t cmd, uint8_t param, const uint8_t *data,
 	ble_notify(pkt, len);
 }
 
-static void is_send_notification(uint8_t cmd, const uint8_t *data,
-				 uint16_t data_len)
+static int is_send_notification(uint8_t cmd, const uint8_t *data,
+				uint16_t data_len)
 {
 	uint8_t pkt[IS_MAX_PACKET];
 	uint16_t len;
 
 	build_notification(cmd, data, data_len, pkt, &len);
-	ble_notify(pkt, len);
+	return ble_notify(pkt, len);
 }
 
 static void is_respond(uint8_t cmd, uint8_t resp_code, const uint8_t *data,
@@ -231,17 +236,39 @@ static void send_hid_status(void)
 	st[5] = 0x01;  /* mouse buffer empty */
 	st[6] = 0x01;  /* consumer buffer empty */
 	/* st[7..9] = reports sent to host since the last notify (the drain
-	 * counts the app uses to replenish its free-space counters). Read and
-	 * reset the per-interface counters atomically.
+	 * counts the app uses to replenish its free-space counters).
+	 *
+	 * v6.7: PEEK (read without reset) the deltas, then only COMMIT
+	 * (subtract) them once the 0x2F has been accepted into the notify
+	 * queue. If the queue is full the counters are left intact so the
+	 * next status reports the accumulated total (self-healing) — a
+	 * dropped 0x2F can no longer permanently lose up to 255 credits.
 	 */
-	usb_hid_drain_counts(&kbd_drained, &mouse_drained, &consumer_drained);
+	usb_hid_drain_counts_peek(&kbd_drained, &mouse_drained, &consumer_drained);
 	st[7] = kbd_drained;
 	st[8] = mouse_drained;
 	st[9] = consumer_drained;
 	st[10] = 0xFF; /* sent-to-host gate: USB Remote reads data[11]==0xFF
 			* (= offset +10) before trusting st[7..9] */
 
-	is_send_notification(IS_CMD_HID_STATUS_NOTIF, st, sizeof(st));
+	/* v6.6-diagnostic: log the raw drain deltas every status interval (RTT
+	 * ground truth) and latch the red LED SOLID the first time any drain
+	 * count is nonzero. The latch is one-way and drives the LED directly
+	 * (app_led_debug is now a no-op), so a solid red LED is an unambiguous
+	 * "drain went nonzero at least once" signal with all other red-LED
+	 * noise removed. See DEBUG_NOTES.md v6.6-diagnostic.
+	 */
+	LOG_INF("HID status: drain kbd=%u mouse=%u consumer=%u",
+		kbd_drained, mouse_drained, consumer_drained);
+	if (kbd_drained || mouse_drained || consumer_drained) {
+		app_drain_latch_set();
+	}
+
+	if (is_send_notification(IS_CMD_HID_STATUS_NOTIF, st,
+				 sizeof(st)) == 0) {
+		usb_hid_drain_counts_commit(kbd_drained, mouse_drained,
+					    consumer_drained);
+	}
 }
 
 static void try_send_ready(void)
@@ -283,20 +310,16 @@ static void status_work_fn(struct k_work *work)
 
 /* --- HID report mapping (spec §6) -------------------------------------- */
 
-/* KeyboardShort (0x2C): [modifiers, keycode] — a complete keystroke.
- * Press, short hold, release. This is the dictation path.
+/* KeyboardShort (0x2C): [modifiers, keycode] is the *current* keyboard
+ * state (spec §2.2 / USB_REMOTE_AND_PROTOCOL_DOCS.md:187-197). Forward it
+ * as exactly one USB report so the per-interface drain count stays 1:1 with
+ * the app's per-report freeSpace decrement. The next report releases the
+ * previous key; do NOT expand into press+release and do NOT skip key==0, or
+ * kbd_sent (2/char) under-reports the app's 3/char and freeSpace leaks to 0.
  */
 static void tap(uint8_t mods, uint8_t key)
 {
-	if (key == 0) {
-		return;
-	}
-
-	if (usb_kbd_report(mods, key) == 0) {
-		k_msleep(KEY_PRESS_MS);
-		usb_kbd_report(0, 0);
-	}
-	k_msleep(KEY_GAP_MS);
+	usb_kbd_report(mods, key);
 }
 
 static void hid_kbd_short(const uint8_t *data, uint16_t data_len, uint8_t n)
@@ -358,8 +381,11 @@ static void hid_touch(const uint8_t *data, uint16_t data_len, uint8_t n)
 /* Consumer (0x22): [reportID, usageLSB, usageMSB] per report.
  * reportID 1 = Consumer page (media keys: Play/Pause 0xCD, Vol+ 0xE9,
  * Vol- 0xEA, Mute 0xE2, next 0xB5, prev 0xB6, …) -> USB consumer report.
- * reportID 2 = System page (power/sleep/wake) -> skipped safely (no System
- * Control collection in this build). Any other report ID is ignored.
+ * reportID 2 = System page (power/sleep/wake) -> no System Control collection
+ * in this build's descriptor, so it cannot be forwarded as a real USB report;
+ * instead credit consumer_sent directly (usb_hid_consumer_credit) so the
+ * app's per-report consumer freeSpace stays 1:1 and never leaks. Any other
+ * report ID is ignored (no credit — not produced by the app).
  */
 static void hid_consumer(const uint8_t *data, uint16_t data_len, uint8_t n)
 {
@@ -371,6 +397,8 @@ static void hid_consumer(const uint8_t *data, uint16_t data_len, uint8_t n)
 
 		if (r[0] == 1) {
 			usb_consumer_report(usage);
+		} else if (r[0] == 2) {
+			usb_hid_consumer_credit(1);
 		}
 	}
 }

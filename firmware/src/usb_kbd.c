@@ -1,11 +1,12 @@
 /* Voice Keyboard — USB HID composite keyboard + mouse + absolute pointer
- * (next USB device stack).
+ * + consumer control (next USB device stack).
  *
- * Single HID interface, one report descriptor with three report IDs:
+ * Single HID interface, one report descriptor with four report IDs:
  *   ID 1 = keyboard (8-byte boot-style input report + LED output report)
  *   ID 2 = mouse (buttons + X/Y/wheel, signed relative int8)
  *   ID 3 = absolute pointer (buttons + X/Y absolute uint16, 0..32767)
- * The host enumerates one USB device exposing all three functions.
+ *   ID 4 = consumer control (16-bit consumer/media usage)
+ * The host enumerates one USB device exposing all four functions.
  *
  * Adapted from Zephyr's samples/subsys/usb/hid-keyboard.
  */
@@ -204,16 +205,18 @@ static const uint8_t hid_report_desc[] = {
 	 * usage (media keys: Play/Pause 0xCD, Vol+ 0xE9, Vol- 0xEA,
 	 * Mute 0xE2, next 0xB5, prev 0xB6, …). Usage page 0x0C (Consumer),
 	 * usage 0x01 (Consumer Control). The 16-bit field is an array over
-	 * the full 0..0xFFFF usage range so the host maps the reported value
-	 * straight to the consumer/media key. Report = ID byte + 2 data
-	 * bytes = 3 bytes (must match CONSUMER_REPORT_COUNT exactly).
+	 * the bounded 0..0x3FF usage range (the standard Consumer page
+	 * extent) so the host maps the reported value straight to the
+	 * consumer/media key — Usage Min 0 keeps "report value == usage"
+	 * (see DEBUG_NOTES.md v6.2). Report = ID byte + 2 data bytes = 3
+	 * bytes (must match CONSUMER_REPORT_COUNT exactly).
 	 */
 	HID_USAGE_PAGE(0x0C),
 	HID_USAGE(0x01),
 	HID_COLLECTION(HID_COLLECTION_APPLICATION),
 		HID_REPORT_ID(VKB_REPORT_ID_CONSUMER),
 		HID_USAGE_MIN16(0, 0),
-		HID_USAGE_MAX16(0xFF, 0xFF),
+		HID_USAGE_MAX16(0xFF, 0x03),
 		HID_LOGICAL_MIN16(0, 0),
 		HID_LOGICAL_MAX16(0xFF, 0xFF),
 		HID_REPORT_SIZE(16),
@@ -230,24 +233,29 @@ static const struct device *hid_dev =
  * Report buffers must satisfy the UDC driver alignment contract
  * (usbd_hid asserts IS_UDC_ALIGNED, but CONFIG_ASSERT is off in this
  * build, so a misaligned buffer would fail silently). Static buffers are
- * safe here: submission is synchronous (this build registers no
- * input_report_done callback, so hid_device_submit_report() blocks until
- * the host has clocked the report out) and there is a single producer
- * (the typing thread). They also serve as the last-report state for
- * hid_get_report().
+ * safe here because they are written ONLY by drain_next(), which holds the
+ * single in-flight slot: a buffer is (re)written immediately before its
+ * report is submitted, and input_report_done() clears in-flight before the
+ * next submit, so a buffer can never be overwritten while its transfer is
+ * still outstanding. The submit functions never touch these buffers — they
+ * build the report directly into a FIFO node, and drain_next() copies the
+ * node into the matching buffer right before submitting (the byte copy also
+ * keeps the FIFO node's possibly-unaligned data out of the UDC DMA path).
+ * The buffers double as the last-report state for kb_get_report().
  */
 UDC_STATIC_BUF_DEFINE(kb_report, KB_REPORT_COUNT);
 UDC_STATIC_BUF_DEFINE(ms_report, MS_REPORT_COUNT);
 UDC_STATIC_BUF_DEFINE(ab_report, AB_REPORT_COUNT);
 UDC_STATIC_BUF_DEFINE(consumer_report, CONSUMER_REPORT_COUNT);
 
-/* Per-interface "reports sent to host" drain counters, incremented on each
- * successful synchronous HID submit (a success means the host clocked the
- * report off the interrupt IN endpoint). Read+reset atomically by the
- * periodic HIDStatusNotification via usb_hid_drain_counts(). The absolute
- * pointer (touchscreen) and consumer-control reports both count into the
- * consumer drain figure, matching InputStick's "touchscreen rides the
- * consumer queue" model (status byte [9] = consumer reports sent).
+/* Per-interface "reports sent to host" drain counters, incremented from the
+ * input_report_done callback (a report is only "sent to host" once the host
+ * has clocked it off the interrupt IN endpoint and the callback fires).
+ * Read+reset atomically by the periodic HIDStatusNotification via
+ * usb_hid_drain_counts(). The absolute pointer (touchscreen) and
+ * consumer-control reports both count into the consumer drain figure,
+ * matching InputStick's "touchscreen rides the consumer queue" model
+ * (status byte [9] = consumer reports sent).
  */
 static atomic_t kbd_sent;
 static atomic_t mouse_sent;
@@ -256,15 +264,159 @@ static atomic_t consumer_sent;
 /* Written by the USBD thread, read by the typing thread. */
 static atomic_t kb_ready;
 
-/* One-shot "host clocked out the first report" debug pulse per session. */
-static bool kb_sent_pulse_done;
+/* v6.5-diagnostic: throttle timestamp for the per-completion red-LED pulse
+ * and RTT log. Replaces the v6.2 one-shot kb_sent_pulse_done: the pulse now
+ * fires on EVERY input_report_done (any report ID), at most once per 300 ms,
+ * so the human can see whether the completion callback actually fires on
+ * hardware. Initialized negative so the very first completion always fires.
+ */
+static int64_t kb_done_pulse_last = -300;
+
+/* --- non-blocking HID submit queue (v6.2) -------------------------------
+ *
+ * One HID interface, one interrupt-IN endpoint, four report IDs — so there
+ * is at most ONE report in flight at a time, shared across all four report
+ * types. Producers build a report directly into a queue node and enqueue;
+ * drain_next() copies the node into the aligned static buffer and submits
+ * at most one node at a time, and the USB stack calls
+ * kb_input_report_done() when that transfer completes, which frees the slot
+ * for the next node. This decouples BLE RX from USB TX: a
+ * slow/stopped host fills the bounded queue (K_NO_WAIT) instead of wedging
+ * the dispatch thread inside hid_device_submit_report().
+ */
+enum hid_report_type {
+	HID_REPORT_KBD = 0,
+	HID_REPORT_MOUSE,
+	HID_REPORT_ABS,
+	HID_REPORT_CONSUMER,
+};
+
+struct hid_report_node {
+	uint8_t type;
+	uint8_t data[KB_REPORT_COUNT]; /* max of the four report sizes */
+};
+
+/* v6.7: 256, not 128. This is a SINGLE queue shared by all four report
+ * types (kbd / mouse / abs / consumer), but the app models per-interface
+ * capacity — 128 keyboard + 64 mouse + 64 consumer = 256 reports in flight
+ * (fw >= 100). At 128 the firmware would silently drop the surplus with no
+ * drain credit (k_msgq_put K_NO_WAIT), leaking the app's freeSpace. 256 is
+ * sufficient because the app self-limits each interface to 128/64/64 and
+ * the drain (~1000 reports/s at 1 ms polling) empties the queue far faster
+ * than the app can fill it. RAM cost is ~256 * sizeof(struct
+ * hid_report_node) ≈ 2.6 KB of the ~206 KB free.
+ */
+#define HID_REPORT_Q_DEPTH 256
+
+K_MSGQ_DEFINE(hid_report_q, sizeof(struct hid_report_node),
+	      HID_REPORT_Q_DEPTH, 4);
+
+/* Non-zero while a report is in flight (submitted, not yet completed). */
+static atomic_t report_in_flight;
+
+static void drain_next(void)
+{
+	struct hid_report_node node;
+	uint8_t *buf;
+	uint16_t len;
+	int ret;
+
+	/* Single in-flight slot shared across all four report types: claim
+	 * it atomically so the dispatch thread and the USB-completion
+	 * callback can never submit two reports at once.
+	 */
+	if (!atomic_cas(&report_in_flight, 0, 1)) {
+		return;
+	}
+
+	while (k_msgq_get(&hid_report_q, &node, K_NO_WAIT) == 0) {
+		switch (node.type) {
+		case HID_REPORT_KBD:
+			buf = kb_report;
+			len = KB_REPORT_COUNT;
+			break;
+		case HID_REPORT_MOUSE:
+			buf = ms_report;
+			len = MS_REPORT_COUNT;
+			break;
+		case HID_REPORT_ABS:
+			buf = ab_report;
+			len = AB_REPORT_COUNT;
+			break;
+		case HID_REPORT_CONSUMER:
+			buf = consumer_report;
+			len = CONSUMER_REPORT_COUNT;
+			break;
+		default:
+			continue; /* corrupt node, drop */
+		}
+
+		memcpy(buf, node.data, len);
+
+		ret = hid_device_submit_report(hid_dev, len, buf);
+		if (ret == 0) {
+			/* in-flight stays 1 until kb_input_report_done() */
+			return;
+		}
+
+		/* Submit failed (e.g. interface not enabled or the IN pool
+		 * momentarily exhausted): drop this report, try the next.
+		 * Never wedge.
+		 */
+		app_led_debug(APP_LED_HID_FAIL);
+		LOG_WRN("HID submit failed (%d), report dropped", ret);
+	}
+
+	/* Queue drained (or all remaining submits failed): release the slot. */
+	atomic_set(&report_in_flight, 0);
+}
+
+static void kb_input_report_done(const struct device *dev,
+				 const uint8_t *const report)
+{
+	ARG_UNUSED(dev);
+
+	/* v6.5-diagnostic: pulse the red LED + log on EVERY completion,
+	 * throttled to one per ~300 ms so it is human-visible. This callback
+	 * runs in USB-stack context and fires up to ~1000/s while the host
+	 * polls; a 2-blink + LOG_INF every 300 ms is the ground-truth signal
+	 * that input_report_done IS reached on hardware (and that the drain
+	 * counters below are being incremented). Non-blocking by design:
+	 * app_led_debug() only reschedules a workqueue item.
+	 */
+	if (k_uptime_get() - kb_done_pulse_last >= 300) {
+		kb_done_pulse_last = k_uptime_get();
+		app_led_debug(APP_LED_HID_SENT);
+		LOG_INF("HID report done: report[0]=0x%02x", report[0]);
+	}
+
+	/* The report pointer is the static buffer we submitted, so report[0]
+	 * is the report-ID byte: 1=kbd, 2=mouse, 3=abs, 4=consumer.
+	 */
+	switch (report[0]) {
+	case VKB_REPORT_ID_KBD:
+		atomic_inc(&kbd_sent);
+		break;
+	case VKB_REPORT_ID_MOUSE:
+		atomic_inc(&mouse_sent);
+		break;
+	case VKB_REPORT_ID_ABS:
+	case VKB_REPORT_ID_CONSUMER:
+		atomic_inc(&consumer_sent);
+		break;
+	default:
+		break;
+	}
+
+	atomic_set(&report_in_flight, 0);
+	drain_next();
+}
 
 static void kb_iface_ready(const struct device *dev, const bool ready)
 {
 	LOG_INF("HID interface %s", ready ? "ready" : "not ready");
 	atomic_set(&kb_ready, ready);
 	if (ready) {
-		kb_sent_pulse_done = false;
 		app_led_debug(APP_LED_HID_READY);
 		/* v6.0: if the InputStick handshake already finished, this is
 		 * what finally sends the Ready notification (USB can enumerate
@@ -365,6 +517,7 @@ static const struct hid_device_ops kb_ops = {
 	.set_idle = kb_set_idle,
 	.get_idle = kb_get_idle,
 	.set_protocol = kb_set_protocol,
+	.input_report_done = kb_input_report_done,
 	.output_report = kb_output_report,
 };
 
@@ -477,6 +630,7 @@ bool usb_kbd_ready(void)
 
 int usb_kbd_report(uint8_t mods, uint8_t key)
 {
+	struct hid_report_node node;
 	int ret;
 
 	if (!atomic_get(&kb_ready)) {
@@ -484,31 +638,29 @@ int usb_kbd_report(uint8_t mods, uint8_t key)
 		return -ENOTCONN;
 	}
 
-	memset(kb_report, 0, KB_REPORT_COUNT);
-	kb_report[KB_REPORT_ID_IDX] = VKB_REPORT_ID_KBD;
-	kb_report[KB_MOD_KEY] = mods;
-	kb_report[KB_KEY_CODE1] = key;
+	/* Build the report directly into the FIFO node; the static buffer is
+	 * written only by drain_next() immediately before submit.
+	 */
+	memset(&node, 0, sizeof(node));
+	node.type = HID_REPORT_KBD;
+	node.data[KB_REPORT_ID_IDX] = VKB_REPORT_ID_KBD;
+	node.data[KB_MOD_KEY] = mods;
+	node.data[KB_KEY_CODE1] = key;
 
-	ret = hid_device_submit_report(hid_dev, KB_REPORT_COUNT, kb_report);
+	ret = k_msgq_put(&hid_report_q, &node, K_NO_WAIT);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
-	} else {
-		atomic_inc(&kbd_sent);
-		if (!kb_sent_pulse_done) {
-			/* Submit is synchronous: a success means the host
-			 * actually polled the report off the interrupt IN
-			 * endpoint.
-			 */
-			kb_sent_pulse_done = true;
-			app_led_debug(APP_LED_HID_SENT);
-		}
+		LOG_WRN("HID queue full, keyboard report dropped");
+		return -ENOBUFS;
 	}
 
-	return ret;
+	drain_next();
+	return 0;
 }
 
 int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel)
 {
+	struct hid_report_node node;
 	int ret;
 
 	if (!atomic_get(&kb_ready)) {
@@ -517,24 +669,28 @@ int usb_mouse_report(uint8_t buttons, int dx, int dy, int wheel)
 	}
 
 	/* The descriptor declares logical min/max -127..127. */
-	ms_report[MS_REPORT_ID_IDX] = VKB_REPORT_ID_MOUSE;
-	ms_report[MS_BUTTONS] = buttons;
-	ms_report[MS_DX] = (uint8_t)CLAMP(dx, -127, 127);
-	ms_report[MS_DY] = (uint8_t)CLAMP(dy, -127, 127);
-	ms_report[MS_WHEEL] = (uint8_t)CLAMP(wheel, -127, 127);
+	memset(&node, 0, sizeof(node));
+	node.type = HID_REPORT_MOUSE;
+	node.data[MS_REPORT_ID_IDX] = VKB_REPORT_ID_MOUSE;
+	node.data[MS_BUTTONS] = buttons;
+	node.data[MS_DX] = (uint8_t)CLAMP(dx, -127, 127);
+	node.data[MS_DY] = (uint8_t)CLAMP(dy, -127, 127);
+	node.data[MS_WHEEL] = (uint8_t)CLAMP(wheel, -127, 127);
 
-	ret = hid_device_submit_report(hid_dev, MS_REPORT_COUNT, ms_report);
+	ret = k_msgq_put(&hid_report_q, &node, K_NO_WAIT);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
-	} else {
-		atomic_inc(&mouse_sent);
+		LOG_WRN("HID queue full, mouse report dropped");
+		return -ENOBUFS;
 	}
 
-	return ret;
+	drain_next();
+	return 0;
 }
 
 int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y)
 {
+	struct hid_report_node node;
 	int ret;
 
 	if (!atomic_get(&kb_ready)) {
@@ -543,25 +699,29 @@ int usb_abs_report(uint8_t buttons, uint16_t x, uint16_t y)
 	}
 
 	/* The descriptor declares logical min/max 0..32767; x/y are uint16. */
-	ab_report[AB_REPORT_ID_IDX] = VKB_REPORT_ID_ABS;
-	ab_report[AB_BUTTONS] = buttons;
-	ab_report[AB_X_LO] = (uint8_t)x;
-	ab_report[AB_X_HI] = (uint8_t)(x >> 8);
-	ab_report[AB_Y_LO] = (uint8_t)y;
-	ab_report[AB_Y_HI] = (uint8_t)(y >> 8);
+	memset(&node, 0, sizeof(node));
+	node.type = HID_REPORT_ABS;
+	node.data[AB_REPORT_ID_IDX] = VKB_REPORT_ID_ABS;
+	node.data[AB_BUTTONS] = buttons;
+	node.data[AB_X_LO] = (uint8_t)x;
+	node.data[AB_X_HI] = (uint8_t)(x >> 8);
+	node.data[AB_Y_LO] = (uint8_t)y;
+	node.data[AB_Y_HI] = (uint8_t)(y >> 8);
 
-	ret = hid_device_submit_report(hid_dev, AB_REPORT_COUNT, ab_report);
+	ret = k_msgq_put(&hid_report_q, &node, K_NO_WAIT);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
-	} else {
-		atomic_inc(&consumer_sent);
+		LOG_WRN("HID queue full, abs report dropped");
+		return -ENOBUFS;
 	}
 
-	return ret;
+	drain_next();
+	return 0;
 }
 
 int usb_consumer_report(uint16_t usage)
 {
+	struct hid_report_node node;
 	int ret;
 
 	if (!atomic_get(&kb_ready)) {
@@ -570,21 +730,23 @@ int usb_consumer_report(uint16_t usage)
 	}
 
 	/* Descriptor declares a single 16-bit consumer usage (array over
-	 * 0..0xFFFF). Report = ID byte + usage LSB + usage MSB = 3 bytes.
+	 * 0..0x3FF). Report = ID byte + usage LSB + usage MSB = 3 bytes.
 	 */
-	consumer_report[CONSUMER_REPORT_ID_IDX] = VKB_REPORT_ID_CONSUMER;
-	consumer_report[CONSUMER_USAGE_LO] = (uint8_t)usage;
-	consumer_report[CONSUMER_USAGE_HI] = (uint8_t)(usage >> 8);
+	memset(&node, 0, sizeof(node));
+	node.type = HID_REPORT_CONSUMER;
+	node.data[CONSUMER_REPORT_ID_IDX] = VKB_REPORT_ID_CONSUMER;
+	node.data[CONSUMER_USAGE_LO] = (uint8_t)usage;
+	node.data[CONSUMER_USAGE_HI] = (uint8_t)(usage >> 8);
 
-	ret = hid_device_submit_report(hid_dev, CONSUMER_REPORT_COUNT,
-				       consumer_report);
+	ret = k_msgq_put(&hid_report_q, &node, K_NO_WAIT);
 	if (ret) {
 		app_led_debug(APP_LED_HID_FAIL);
-	} else {
-		atomic_inc(&consumer_sent);
+		LOG_WRN("HID queue full, consumer report dropped");
+		return -ENOBUFS;
 	}
 
-	return ret;
+	drain_next();
+	return 0;
 }
 
 void usb_hid_drain_counts(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer)
@@ -592,4 +754,66 @@ void usb_hid_drain_counts(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer)
 	*kbd = (uint8_t)MIN(atomic_clear(&kbd_sent), 255);
 	*mouse = (uint8_t)MIN(atomic_clear(&mouse_sent), 255);
 	*consumer = (uint8_t)MIN(atomic_clear(&consumer_sent), 255);
+}
+
+/* v6.7: read WITHOUT resetting — the drain deltas are only committed
+ * (subtracted) once the 0x2F that carries them is actually accepted into
+ * the BLE notify queue. Otherwise a dropped notification would permanently
+ * lose up to 255 credits per interface.
+ */
+void usb_hid_drain_counts_peek(uint8_t *kbd, uint8_t *mouse, uint8_t *consumer)
+{
+	*kbd = (uint8_t)MIN(atomic_get(&kbd_sent), 255);
+	*mouse = (uint8_t)MIN(atomic_get(&mouse_sent), 255);
+	*consumer = (uint8_t)MIN(atomic_get(&consumer_sent), 255);
+}
+
+/* Saturating subtract of a drain delta: decrement the counter by exactly the
+ * reported delta, never below zero. The CAS loop (rather than a bare
+ * atomic_sub) makes it race-safe — a completion can land between the peek
+ * and the commit, or two status sends can race on the dispatch thread vs the
+ * system workqueue; re-reading + re-clamping prevents an atomic_sub() from
+ * wrapping the counter negative (which would surface as a bogus ~255 credit).
+ */
+static void drain_saturating_sub(atomic_t *counter, uint8_t delta)
+{
+	atomic_val_t old;
+	atomic_val_t new;
+
+	if (delta == 0) {
+		return;
+	}
+
+	old = atomic_get(counter);
+	for (;;) {
+		new = (old > delta) ? (old - delta) : 0;
+		if (atomic_cas(counter, old, new)) {
+			return;
+		}
+		old = atomic_get(counter);
+	}
+}
+
+/* v6.7: commit (subtract) exactly the deltas that were peeked and reported
+ * in a successfully-queued 0x2F. Call only after the notify enqueue returned
+ * 0. Any reports that completed after the peek stay in the counters for the
+ * next status (self-healing).
+ */
+void usb_hid_drain_counts_commit(uint8_t kbd, uint8_t mouse, uint8_t consumer)
+{
+	drain_saturating_sub(&kbd_sent, kbd);
+	drain_saturating_sub(&mouse_sent, mouse);
+	drain_saturating_sub(&consumer_sent, consumer);
+}
+
+/* v6.7: credit the consumer drain counter without a USB submit. Used for
+ * 0x22 reports with report ID 2 (System page): the descriptor exposes no
+ * System Control collection, so the report cannot be forwarded — but the app
+ * already decremented its consumer freeSpace for it, so crediting
+ * consumer_sent keeps the per-report accounting 1:1 and prevents a freeSpace
+ * leak.
+ */
+void usb_hid_consumer_credit(uint8_t count)
+{
+	atomic_add(&consumer_sent, count);
 }

@@ -16,6 +16,12 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec dbg_led =
 	GPIO_DT_SPEC_GET_OR(DT_ALIAS(led1), gpios, {0});
 
+/* v6.6-diagnostic: latched drain indicator (0 = never nonzero, 1 = nonzero
+ * seen at least once). Set by app_drain_latch_set() from inputstick.c's
+ * send_hid_status(); see DEBUG_NOTES.md v6.6-diagnostic.
+ */
+static atomic_t drain_latch;
+
 static uint8_t dbg_pulses;
 static uint16_t dbg_on_ms;
 static uint16_t dbg_off_ms;
@@ -148,6 +154,17 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 
 void app_led_debug(enum app_led_code code)
 {
+	/* v6.6-diagnostic: DISABLED (no-op). The single red LED carried too
+	 * many overlapping pulse codes to read on hardware (RX-write 1-blink,
+	 * callback heartbeat, handshake/connect codes 9/12/13, HID fail,
+	 * mouse/abs RX, and the v6.5 drain pulses). This early return silences
+	 * them all; app_drain_latch_set() now drives the LED directly. The
+	 * switch below is retained (not deleted) so re-enabling is a one-line
+	 * revert.
+	 */
+	ARG_UNUSED(code);
+	return;
+
 	if (dbg_led.port == NULL) {
 		return;
 	}
@@ -198,12 +215,36 @@ void app_led_debug(enum app_led_code code)
 	case APP_LED_IS_READY:
 		dbg_on_ms = 200; dbg_off_ms = 200; dbg_pulses = 4;
 		break;
+	/* v6.5-diagnostic: drain-count ground truth (see DEBUG_NOTES.md
+	 * v6.5-diagnostic). 3 fast blinks = a nonzero drain was computed this
+	 * status interval; 1 long blink = all three drains are 0.
+	 */
+	case APP_LED_DRAIN_NONZERO:
+		dbg_on_ms = 50; dbg_off_ms = 50; dbg_pulses = 3;
+		break;
+	case APP_LED_DRAIN_ZERO:
+		dbg_on_ms = 200; dbg_off_ms = 0; dbg_pulses = 1;
+		break;
 	default:
 		return;
 	}
 
 	if (!dbg_led_on) {
 		k_work_reschedule(&dbg_led_work, K_NO_WAIT);
+	}
+}
+
+/* v6.6-diagnostic: one-way drain latch. inputstick.c send_hid_status() calls
+ * this the first time it sees any nonzero drain count; it sets the flag and
+ * turns the red LED SOLID directly (no pulse work item), guarded on the LED
+ * existing. Solid red = "drain went nonzero at least once"; dark red =
+ * "drain always zero". The latch never clears, so solid stays solid.
+ */
+void app_drain_latch_set(void)
+{
+	atomic_set(&drain_latch, 1);
+	if (dbg_led.port != NULL) {
+		gpio_pin_set_dt(&dbg_led, 1);
 	}
 }
 
